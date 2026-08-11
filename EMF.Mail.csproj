@@ -15,6 +15,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\..\EMF.DMS.Client\EMF.DMS.Client\EMF.DMS.Client.csproj" />
     <ProjectReference Include="..\EMF.Filer\EMF.Filer.csproj" />
     <ProjectReference Include="..\..\EMF.Cheing\Cheing.csproj" />
     <ProjectReference Include="..\..\Cheing.Net\Cheing.Net.Ai\Cheing.Net.Ai.csproj" />
