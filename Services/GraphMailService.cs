@@ -111,10 +111,10 @@ namespace EMF.Mail.Services
         // /forward is fire-and-forget (202, no body) so it can't hand back the sent message's id. createForward
         // returns the draft as a full message object (id assigned at creation), which we then send explicitly --
         // that id becomes FwdMsgId, the anchor the admin's reply chain gets matched back against.
-        public async Task<string?> SendApprovalRequestAsync(string messageId, string toAddr)
+        // comment now varies by call site -- whether Claude proposed a candidate vendor or not -- instead of
+        // being a single hardcoded sentence.
+        public async Task<string?> SendApprovalRequestAsync(string messageId, string toAddr, string comment)
         {
-            var comment = "This sender has no prior submission history and is on hold pending approval. Reply APPROVE or REJECT.";
-
             var draft = await _graph.Users[_mailboxUpn].Messages[messageId].CreateForward.PostAsync(new()
             {
                 Comment = comment,
