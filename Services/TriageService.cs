@@ -83,12 +83,14 @@ namespace EMF.Mail.Services
 
                         {{processDesc}}
 
-                        The document image above is already open, so also do this now for each "Processing" attachment (skip
-                        "Supporting" attachments -- they are never extracted): determine which of the following document types
-                        it is, then extract its fields accordingly, exactly as you would for that type. Set that attachment's
-                        DocTpId to the matched type's id, and ExtractedFields to an object with exactly that type's field keys.
-                        If this turns out to be an Inquiry, or there are no Processing attachments after grouping, leave every
-                        attachment's DocTpId and ExtractedFields null -- there is nothing to extract in that case.
+                        The document image above is already open, so also do this now for every attachment (Processing and
+                        Supporting alike): determine which of the following document types it is, and set that attachment's
+                        DocTpId to the matched type's id. For "Processing" attachments only, also extract its fields into
+                        ExtractedFields, exactly as you would for that type -- "Supporting" attachments are typed but never
+                        extracted, so leave their ExtractedFields null. If a "Supporting" attachment doesn't match any known
+                        document type, leave its DocTpId null rather than guessing.
+                        If this turns out to be an Inquiry, or there are no attachments after grouping, leave every attachment's
+                        DocTpId and ExtractedFields null -- there is nothing to type or extract in that case.
 
                         {{string.Join("\n\n", sections)}}
                         """;

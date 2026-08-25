@@ -15,6 +15,7 @@ namespace EMF.Mail.Models
         public string ClientId { get; set; } = string.Empty;
         public string SecretName { get; set; } = string.Empty;
         public DateTime LastPollDT { get; set; }
+        public string? LastMsgLink { get; set; }
     }
     public class AppUser
     {
@@ -98,9 +99,11 @@ namespace EMF.Mail.Models
         public string? VendName { get; set; }
         public List<AttachmentLabel> Attachments { get; set; } = [];
     }
-    // DocTpId/ExtractedFields are only ever populated for a "Processing" attachment on a known sender's
-    // Submission -- that's the one case triage already has the document image open (see TriageService),
-    // so classification and extraction happen there instead of Filer reading the same file again later.
+    // ExtractedFields is only ever populated for a "Processing" attachment on a known sender's Submission --
+    // that's the one case triage already has the document image open (see TriageService), so extraction
+    // happens there instead of Filer reading the same file again later. DocTpId, however, is now set for
+    // Supporting attachments too (typed, not extracted) so ap.sprTblGetTasks can recognize the requirement
+    // as satisfied instead of everything landing under the generic "Misc" doc type.
     public class AttachmentLabel
     {
         public string FileName { get; set; } = string.Empty;
@@ -115,4 +118,85 @@ namespace EMF.Mail.Models
     public record AttachmentContent(string FileName, byte[] Bytes, string MediaType);
 
     public class EmailReply { public string Body { get; set; } = string.Empty; }
+
+    // Result of /ap/pkg/tasks -- one row per outstanding (or already-satisfied) attachment requirement for
+    // a package, per its invoice type (ap.LstInvcTypeDocTypes). Same shape DMS's TaskPane consumes; Mail
+    // calls the same handler with a list of PkgNo (one submission can create more than one package) so the
+    // gap-check for a whole submission is one round trip, not one per package.
+    public class PkgTask
+    {
+        public int PkgNo { get; set; }
+        public int DocTypeId { get; set; }
+        public string Task { get; set; } = string.Empty;
+        public bool IsComplete { get; set; }
+        public bool IsOptional { get; set; }
+    }
+
+    // Result of /msg/mail/rfibridge -- resolves a vendor's reply back to the open msg.TblInfoRequests row
+    // it's answering, via In-Reply-To/References matched against SentMsgId. SentTo is returned so the
+    // caller can confirm the reply's sender matches who the RFI was actually sent to -- sufficient
+    // authorization for this one thread even for a sender with no other approval on file (e.g. a
+    // freight forwarder), without needing a static whitelist for every ad hoc external party.
+    public class RfiBridgeResult
+    {
+        public int IReqNo { get; set; }
+        public int PkgNo { get; set; }
+        public int? MsgNo { get; set; }
+        public int ConvNo { get; set; }
+        public string SentTo { get; set; } = string.Empty;
+    }
+
+    // Payload for /msg/req/open -- ReqUId null means system-generated (the only origin EMF.Mail creates
+    // today; NotNo/user-initiated-via-PkgNotify origin is deferred, see ProjectContext).
+    public class InfoRequest
+    {
+        public int PkgNo { get; set; }
+        public int? MsgNo { get; set; }
+        public int? NotNo { get; set; }
+        public string SentMsgId { get; set; } = string.Empty;
+        public string SentTo { get; set; } = string.Empty;
+        public int? ReqUId { get; set; }
+        public int ConvNo { get; set; }
+    }
+    public class InfoRequestOpenResult 
+    { 
+        public int IReqNo { get; set; } 
+    }
+    // Payload for /filer/msg/finalize -- single write-back point for a message's terminal state. Null
+    // fields leave the corresponding column untouched (see the proc). IReqNo absorbs what used to be a
+    // separate /filer/msg/linkreply call -- only ever set on the RFI-reply finalize.
+    public class MessageFinalize
+    {
+        public int MsgNo { get; set; }
+        public TriageResult? MsgContext { get; set; }
+        public string? MsgTpCode { get; set; }
+        public bool? IsHeld { get; set; }
+        public string? FwdMsgId { get; set; }
+        public int? IReqNo { get; set; }
+        public string ResTpCode { get; set; } = string.Empty;
+        public string? MsgResult { get; set; }
+    }
+
+    // Payload for /filer/msg/resolvecmd -- releases a held sender/vendor batch and logs the admin's
+    // APPROVE/REJECT command against msg.TblCommands in one transactional call.
+    public class CommandResolve
+    {
+        public int SenderId { get; set; }
+        public int VendId { get; set; }
+        public int AnchorMsgNo { get; set; }
+        public bool IsApproved { get; set; }
+        public string CmdCode { get; set; } = string.Empty;
+        public int AdminMsgNo { get; set; }
+        public string? Reference { get; set; }
+        public int ResultCode { get; set; }
+        public string? ResultMsg { get; set; }
+    }
+    // Payload for /filer/msg/lastpoll -- LastPollDT stays as an audit "last run" timestamp; LastMsgLink is
+    // the actual delta bookmark now driving what GetChangedMessagesAsync fetches next round.
+    public class AccountPoll
+    {
+        public int AcctId { get; set; }
+        public DateTime LastPollDT { get; set; }
+        public string? LastMsgLink { get; set; }
+    }
 }
