@@ -17,7 +17,7 @@ namespace EMF.Mail;
 
 public static class Program
 {
-    
+
     public static async Task Main(string[] args) // args reserved for future CLI arguments (e.g. --account, --since).
     {
         var config = new ConfigurationBuilder()
@@ -38,12 +38,12 @@ public static class Program
         var triageSvc = new TriageService(claude, db, classifier);
         var cmdSvc = new CommandService(claude);
         var filerDataSvc = new FilerDataService(db);
-        var dms = new PackageService(db);
+        var dms = new PkgService(db);
         var filer = new Filer(filerDataSvc, classifier, dms);
         var mailDataSvc = new MailDataService(db);
         var conv = new ConversationService(db);
 
-        var processor = new MessageProcessor(config, mailDataSvc, filerDataSvc, triageSvc, cmdSvc, classifier, filer, conv);
+        var processor = new MessageProcessor(mailDataSvc, filerDataSvc, triageSvc, cmdSvc, classifier, filer, conv);
 
         while (true)
         {
@@ -51,7 +51,17 @@ public static class Program
             Tracker.Track($"Loaded {accounts.Count} mail account(s).");
 
             foreach (var account in accounts)
-                await processor.ProcessAccountAsync(account);
+            {
+                // ProvCode-keyed construction -- GraphMailService is the only implementation today, so
+                // every account resolves here. A future provider adds a branch, not a change anywhere else.
+                IMailService mail = account.ProvCode switch
+                {
+                    "GRAPH" or "" => new GraphMailService(account, config[$"MailSecrets:{account.SecretName}"] ?? throw new InvalidOperationException($"Secret '{account.SecretName}' not found in configuration.")),
+                    _ => throw new InvalidOperationException($"Account {account.AcctName}: unsupported ProvCode '{account.ProvCode}'.")
+                };
+
+                await processor.ProcessAccountAsync(account, mail);
+            }
 
             await Task.Delay(TimeSpan.FromMinutes(1));
         }

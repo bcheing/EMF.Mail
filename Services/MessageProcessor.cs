@@ -1,38 +1,29 @@
-﻿using Cheing;
+using Cheing;
 using Cheing.Net.Ai;
 using EMF.FilerSvc;
 using EMF.FilerSvc.Models;
 using EMF.Mail.Models;
-using Microsoft.Extensions.Configuration;
-using Microsoft.Graph.Models;
 using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text.Json;
 using System.Threading.Tasks;
 using FilerDataService = EMF.FilerSvc.Services.DataService;
-using GraphMessage = Microsoft.Graph.Models.Message;
 
 namespace EMF.Mail.Services
 {
-    public class MessageProcessor(IConfiguration config, DataService mailDataSvc, FilerDataService filerDataSvc, TriageService triageSvc, CommandService cmdSvc, ClaudeClassifier classifier, Filer filer, ConversationService conv)
+    public class MessageProcessor(DataService mailDataSvc, FilerDataService filerDataSvc, TriageService triageSvc, CommandService cmdSvc, ClaudeClassifier classifier, Filer filer, ConversationService conv)
     {
         private static readonly JsonSerializerOptions _jsonOpts = new() { PropertyNameCaseInsensitive = true };
 
         // Runs vendor identification + SUB/INQ classification for a message. Always runs, regardless of the
         // sender's linked-vendor count -- see TriageService for why. Returns the sender's linked-vendor history
         // alongside the classify result since callers need both (approval check + the fan-out-relevant list).
-        private async Task<(Result<TriageResult> Result, List<SenderHistory> History)> ClassifyMessageAsync(MailAccount account, List<DocType> docTypes, Dictionary<int, List<ClaudeFieldSpec>> fieldsByDocType, string processDesc, GraphMessage message, int senderId)
+        private async Task<(Result<TriageResult> Result, List<SenderHistory> History)> ClassifyMessageAsync(MailAccount account, List<DocType> docTypes, Dictionary<int, List<ClaudeFieldSpec>> fieldsByDocType, string processDesc, Message message, int senderId)
         {
             var history = await mailDataSvc.GetSenderHistoryAsync(account.GetSenderHistHndName, senderId, account.AppId);
-            var attachments = (message.Attachments?.OfType<FileAttachment>() ?? [])
-                .Where(a => a.ContentBytes is not null)
-                .Select(a => new AttachmentContent(a.Name ?? "", a.ContentBytes!, Filer.GetMediaType(a.Name ?? "")))
-                .ToList();
-            var body = message.Body?.Content ?? "";
-            var fromAddr = message.From?.EmailAddress?.Address ?? "";
 
-            var result = await triageSvc.ClassifyAsync(message.Subject ?? "", body, fromAddr, attachments, docTypes, history, processDesc, fieldsByDocType);
+            var result = await triageSvc.ClassifyAsync(message.Subject, message.Body, message.FromAddr, message.Attachments, docTypes, history, processDesc, fieldsByDocType);
             return (result, history);
         }
 
@@ -56,7 +47,7 @@ namespace EMF.Mail.Services
         // per PkgNo with outstanding gaps, not one combined email for the whole submission -- keeps the
         // bridge match unambiguous (rfibridge's SentMsgId lookup resolves to exactly one row) without needing
         // to work out which package a reply is about when a submission created more than one.
-        private async Task CheckAndRequestMissingDocsAsync(GraphMailService mail, GraphMessage message, string fromAddr, int msgNo, List<int> pkgNos)
+        private async Task CheckAndRequestMissingDocsAsync(IMailService mail, Message message, string fromAddr, int msgNo, List<int> pkgNos)
         {
             var tasks = await mailDataSvc.GetPkgTasksAsync(pkgNos);
 
@@ -73,7 +64,7 @@ namespace EMF.Mail.Services
                 }
 
                 var body = ComposeInfoRequestBody(gaps);
-                var sentMsgId = await mail.SendInfoRequestAsync(message.Id!, body);
+                var sentMsgId = await mail.SendInfoRequestAsync(message.ProvMsgId, body);
                 if (sentMsgId is null)
                 {
                     Tracker.Track($"PkgNo {group.Key}: failed to send info request email.");
@@ -105,14 +96,14 @@ namespace EMF.Mail.Services
         // (classification is reused from the original hold's saved MsgContext, not re-run). saveContext is
         // false on the fan-out path -- MsgContext was already written when the message was first held, so
         // the finalize call there only needs to touch MsgTpId/ResTpId/IsProcessed, not resave it.
-        private async Task ProcessClassifiedMessageAsync(MailAccount account, GraphMailService mail, GraphMessage message, int msgNo, int senderId, TriageResult triageResult, bool saveContext)
+        private async Task ProcessClassifiedMessageAsync(MailAccount account, IMailService mail, Message message, int msgNo, int senderId, TriageResult triageResult, bool saveContext)
         {
             var context = saveContext ? triageResult : null;
 
             if (triageResult.MsgTpCode is null)
             {
-                await mail.MarkNeedsReviewAsync(message.Id!);
-                await mail.ForwardAsync(message.Id!, account.AdmAcctEMail, "This message could not be classified and needs manual review.");
+                await mail.MarkNeedsReviewAsync(message.ProvMsgId);
+                await mail.ForwardAsync(message.ProvMsgId, account.AdmAcctEMail, "This message could not be classified and needs manual review.");
                 await mailDataSvc.FinalizeMessageAsync(new MessageFinalize { MsgNo = msgNo, MsgContext = context, ResTpCode = "REVIEW", MsgResult = "Could not determine message type." });
                 Tracker.Track($"MsgNo {msgNo}: could not classify message, flagged for review.");
                 return;
@@ -130,8 +121,8 @@ namespace EMF.Mail.Services
                     return;
                 }
 
-                await mail.ReplyAsync(message.Id!, reply.Value);
-                await mail.FlagProcessedAsync(message.Id!);
+                await mail.ReplyAsync(message.ProvMsgId, reply.Value);
+                await mail.FlagProcessedAsync(message.ProvMsgId);
                 await mailDataSvc.FinalizeMessageAsync(new MessageFinalize { MsgNo = msgNo, MsgContext = context, MsgTpCode = triageResult.MsgTpCode, ResTpCode = "OK", MsgResult = $"Inquiry reply sent ({matches.Count} match(es) found)." });
                 Tracker.Track($"MsgNo {msgNo}: inquiry reply sent ({matches.Count} match(es) found).");
                 return;
@@ -149,20 +140,18 @@ namespace EMF.Mail.Services
                     continue;
                 }
 
-                var attachment = message.Attachments?.OfType<FileAttachment>().FirstOrDefault(a => a.Name == processing.FileName);
-                if (attachment?.ContentBytes is null)
+                var attachment = message.Attachments.FirstOrDefault(a => a.FileName == processing.FileName);
+                if (attachment is null)
                 {
                     Tracker.Track($"MsgNo {msgNo}: attachment {processing.FileName} not found or empty, skipping.");
                     continue;
                 }
 
-                var mediaType = Filer.GetMediaType(processing.FileName);
-
                 // Already classified + extracted during triage (known sender, document image was already
                 // open for vendor purposes) -- skip Filer reading the same document a second/third time.
                 var result = processing.DocTpId is not null && processing.ExtractedFields is not null
-                    ? await filer.SaveExtractedDocumentAsync(account.AppId, account.OwnerUId, processing.DocTpId.Value, processing.ExtractedFields, attachment.ContentBytes, processing.FileName)
-                    : await filer.ProcessDocumentAsync(account.AppId, account.OwnerUId, attachment.ContentBytes, mediaType, processing.FileName);
+                    ? await filer.SaveExtractedDocumentAsync(account.AppId, account.OwnerUId, processing.DocTpId.Value, processing.ExtractedFields, attachment.Bytes, processing.FileName)
+                    : await filer.ProcessDocumentAsync(account.AppId, account.OwnerUId, attachment.Bytes, attachment.MediaType, processing.FileName);
                 if (result.IsFailure)
                 {
                     Tracker.Track($"MsgNo {msgNo}: {result.Message}");
@@ -175,16 +164,16 @@ namespace EMF.Mail.Services
 
                 foreach (var supporting in group.Where(a => a.Label == "Supporting"))
                 {
-                    var suppAttachment = message.Attachments?.OfType<FileAttachment>().FirstOrDefault(a => a.Name == supporting.FileName);
-                    if (suppAttachment?.ContentBytes is null)
+                    var suppAttachment = message.Attachments.FirstOrDefault(a => a.FileName == supporting.FileName);
+                    if (suppAttachment is null)
                     {
                         Tracker.Track($"MsgNo {msgNo}: supporting attachment {supporting.FileName} not found or empty, skipping.");
                         continue;
                     }
 
                     var attachResult = supporting.DocTpId is not null
-                        ? await filer.AttachDocumentAsync(account.AppId, result.Value.PkgNo, supporting.DocTpId.Value, suppAttachment.ContentBytes, supporting.FileName)
-                        : await filer.AttachDocumentAsync(result.Value.PkgNo, suppAttachment.ContentBytes, supporting.FileName);
+                        ? await filer.AttachDocumentAsync(account.AppId, result.Value.PkgNo, supporting.DocTpId.Value, suppAttachment.Bytes, supporting.FileName)
+                        : await filer.AttachDocumentAsync(result.Value.PkgNo, suppAttachment.Bytes, supporting.FileName);
                     if (attachResult.IsFailure)
                     {
                         Tracker.Track($"MsgNo {msgNo}: {attachResult.Message}");
@@ -200,13 +189,12 @@ namespace EMF.Mail.Services
 
             if (reqNos.Count > 0)
             {
-                await mail.FlagProcessedAsync(message.Id!);
-                await mail.ReplyAsync(message.Id!, $"Your request(s) were registered. Reference number(s): {string.Join(", ", reqNos)}");
+                await mail.FlagProcessedAsync(message.ProvMsgId);
+                await mail.ReplyAsync(message.ProvMsgId, $"Your request(s) were registered. Reference number(s): {string.Join(", ", reqNos)}");
                 await mailDataSvc.FinalizeMessageAsync(new MessageFinalize { MsgNo = msgNo, MsgContext = context, MsgTpCode = triageResult.MsgTpCode, ResTpCode = "OK" });
 
-                var fromAddr = message.From?.EmailAddress?.Address ?? "";
                 var pkgNos = items.Select(i => i.PkgNo).Distinct().ToList();
-                await CheckAndRequestMissingDocsAsync(mail, message, fromAddr, msgNo, pkgNos);
+                await CheckAndRequestMissingDocsAsync(mail, message, message.FromAddr, msgNo, pkgNos);
             }
             else
             {
@@ -217,28 +205,27 @@ namespace EMF.Mail.Services
 
         // Handles one inbound (non-admin) message: log it, classify it, then either hold for approval
         // or process it immediately depending on the sender's vendor link.
-        private async Task ProcessInboundMessageAsync(MailAccount account, GraphMailService mail, List<DocType> docTypes, Dictionary<int, List<ClaudeFieldSpec>> fieldsByDocType, string processDesc, GraphMessage message)
+        private async Task ProcessInboundMessageAsync(MailAccount account, IMailService mail, List<DocType> docTypes, Dictionary<int, List<ClaudeFieldSpec>> fieldsByDocType, string processDesc, Message message)
         {
-            var fromAddr = message.From?.EmailAddress?.Address ?? "";
-            var msgId = message.InternetMessageId ?? message.Id!;
+            var msgId = message.InternetMessageId ?? message.ProvMsgId;
 
             var msgResult = await mailDataSvc.SaveMessageAsync(new MailMessage
             {
                 AcctId = account.AcctId,
                 MsgId = msgId,
-                FromAddr = fromAddr,
-                FromName = message.From?.EmailAddress?.Name ?? "",
-                RcptDate = message.ReceivedDateTime?.DateTime ?? DateTime.UtcNow,
-                Subject = message.Subject ?? "",
-                OrigMsgId = GraphMailService.GetOrigMsgId(message)
+                FromAddr = message.FromAddr,
+                FromName = message.FromName,
+                RcptDate = message.ReceivedDateTime,
+                Subject = message.Subject,
+                OrigMsgId = message.OrigMsgId
             });
 
             if (msgResult.IsFailure)
             {
                 if (msgResult.Code == "2627")
-                    Tracker.Track($"{fromAddr}: message already logged, skipping.");
+                    Tracker.Track($"{message.FromAddr}: message already logged, skipping.");
                 else
-                    Tracker.Track($"{fromAddr}: failed to log message ({msgResult.Message}).");
+                    Tracker.Track($"{message.FromAddr}: failed to log message ({msgResult.Message}).");
                 return;
             }
 
@@ -249,8 +236,8 @@ namespace EMF.Mail.Services
 
             if (classifyResult.IsFailure)
             {
-                await mail.MarkNeedsReviewAsync(message.Id!);
-                await mail.ForwardAsync(message.Id!, account.AdmAcctEMail, "This message could not be classified and needs manual review.");
+                await mail.MarkNeedsReviewAsync(message.ProvMsgId);
+                await mail.ForwardAsync(message.ProvMsgId, account.AdmAcctEMail, "This message could not be classified and needs manual review.");
                 await mailDataSvc.FinalizeMessageAsync(new MessageFinalize { MsgNo = msgNo, ResTpCode = "REVIEW", MsgResult = $"Claude classification failed: {classifyResult.Message}" });
                 Tracker.Track($"MsgNo {msgNo}: Claude classification failed ({classifyResult.Message}).");
                 return;
@@ -276,14 +263,14 @@ namespace EMF.Mail.Services
                 var missingInfo = GetMissingInfo(triageResult, isKnownSender);
 
                 if (pending.Count == 0)
-                    fwdMsgId = await mail.SendApprovalRequestAsync(message.Id!, account.AdmAcctEMail, GetApprovalComment(triageResult, isKnownSender, missingInfo));
+                    fwdMsgId = await mail.SendApprovalRequestAsync(message.ProvMsgId, account.AdmAcctEMail, GetApprovalComment(triageResult, isKnownSender, missingInfo));
 
                 var resTpCode = missingInfo.Count > 0 ? "PARTIAL" : "HELD";
                 var msgResultText = missingInfo.Count > 0 ? string.Join("; ", missingInfo) : null;
 
                 var logMsg = pending.Count == 0
-                    ? $"MsgNo {msgNo} ({fromAddr}): sender not linked to identified vendor, held pending admin approval."
-                    : $"MsgNo {msgNo} ({fromAddr}): already has a pending request for this vendor, held silently.";
+                    ? $"MsgNo {msgNo} ({message.FromAddr}): sender not linked to identified vendor, held pending admin approval."
+                    : $"MsgNo {msgNo} ({message.FromAddr}): already has a pending request for this vendor, held silently.";
 
                 await mailDataSvc.FinalizeMessageAsync(new MessageFinalize { MsgNo = msgNo, MsgContext = triageResult, MsgTpCode = triageResult.MsgTpCode, IsHeld = true, FwdMsgId = fwdMsgId, ResTpCode = resTpCode, MsgResult = msgResultText });
                 Tracker.Track(logMsg);
@@ -305,39 +292,36 @@ namespace EMF.Mail.Services
         // closed here and the admin is notified; no further automated contact with the sender on this
         // request. Vendor gets no reply at all in either branch for now -- deliberate, a later admin-command
         // pass may add one back.
-        private async Task ProcessInfoRequestReplyAsync(MailAccount account, GraphMailService mail, GraphMessage message, RfiBridgeResult bridge, List<DocType> docTypes, string processDesc)
+        private async Task ProcessInfoRequestReplyAsync(MailAccount account, IMailService mail, Message message, RfiBridgeResult bridge, List<DocType> docTypes, string processDesc)
         {
-            var fromAddr = message.From?.EmailAddress?.Address ?? "";
-            var msgId = message.InternetMessageId ?? message.Id!;
+            var msgId = message.InternetMessageId ?? message.ProvMsgId;
 
             var msgResult = await mailDataSvc.SaveMessageAsync(new MailMessage
             {
                 AcctId = account.AcctId,
                 MsgId = msgId,
-                FromAddr = fromAddr,
-                FromName = message.From?.EmailAddress?.Name ?? "",
-                RcptDate = message.ReceivedDateTime?.DateTime ?? DateTime.UtcNow,
-                Subject = message.Subject ?? "",
-                OrigMsgId = GraphMailService.GetOrigMsgId(message)
+                FromAddr = message.FromAddr,
+                FromName = message.FromName,
+                RcptDate = message.ReceivedDateTime,
+                Subject = message.Subject,
+                OrigMsgId = message.OrigMsgId
             });
 
             if (msgResult.IsFailure)
             {
                 if (msgResult.Code == "2627")
-                    Tracker.Track($"{fromAddr}: RFI reply already logged, skipping.");
+                    Tracker.Track($"{message.FromAddr}: RFI reply already logged, skipping.");
                 else
-                    Tracker.Track($"{fromAddr}: failed to log RFI reply ({msgResult.Message}).");
+                    Tracker.Track($"{message.FromAddr}: failed to log RFI reply ({msgResult.Message}).");
                 return;
             }
 
             var msgNo = msgResult.Value.MsgNo;
 
-            var attachments = (message.Attachments?.OfType<FileAttachment>() ?? [])
-                .Where(a => a.ContentBytes is not null)
-                .ToList();
+            var attachments = message.Attachments;
 
-            var replyText = GetPlainText(message.UniqueBody?.Content ?? message.Body?.Content ?? "");
-            await conv.AppendItemAsync(bridge.ConvNo, "user", $"{replyText}\nAttachments: {(attachments.Count > 0 ? string.Join(", ", attachments.Select(a => a.Name)) : "none")}");
+            var replyText = GetPlainText(message.UniqueBody);
+            await conv.AppendItemAsync(bridge.ConvNo, "user", $"{replyText}\nAttachments: {(attachments.Count > 0 ? string.Join(", ", attachments.Select(a => a.FileName)) : "none")}");
 
             var outstanding = (await mailDataSvc.GetPkgTasksAsync([bridge.PkgNo])).Where(t => !t.IsComplete).ToList();
 
@@ -355,24 +339,23 @@ namespace EMF.Mail.Services
 
                 foreach (var attachment in attachments)
                 {
-                    var mediaType = Filer.GetMediaType(attachment.Name ?? "");
-                    var classifyResult = await classifier.ClassifyAsync(attachment.ContentBytes!, mediaType, processDesc, options);
+                    var classifyResult = await classifier.ClassifyAsync(attachment.Bytes, attachment.MediaType, processDesc, options);
 
                     if (classifyResult.IsFailure || !options.Any(o => o.Id == classifyResult.Value.Id))
                     {
-                        Tracker.Track($"IReqNo {bridge.IReqNo}: attachment {attachment.Name} did not match an outstanding requirement, skipping.");
+                        Tracker.Track($"IReqNo {bridge.IReqNo}: attachment {attachment.FileName} did not match an outstanding requirement, skipping.");
                         continue;
                     }
 
-                    var attachResult = await filer.AttachDocumentAsync(account.AppId, bridge.PkgNo, classifyResult.Value.Id, attachment.ContentBytes!, attachment.Name ?? "");
+                    var attachResult = await filer.AttachDocumentAsync(account.AppId, bridge.PkgNo, classifyResult.Value.Id, attachment.Bytes, attachment.FileName);
                     if (attachResult.IsFailure)
                     {
-                        Tracker.Track($"IReqNo {bridge.IReqNo}: failed to attach {attachment.Name} ({attachResult.Message}).");
+                        Tracker.Track($"IReqNo {bridge.IReqNo}: failed to attach {attachment.FileName} ({attachResult.Message}).");
                         continue;
                     }
 
                     items.Add(new MessageItem { MsgNo = msgNo, PkgNo = bridge.PkgNo, DocNo = attachResult.Value });
-                    Tracker.Track($"IReqNo {bridge.IReqNo}: attached {attachment.Name} as DocTypeId {classifyResult.Value.Id}.");
+                    Tracker.Track($"IReqNo {bridge.IReqNo}: attached {attachment.FileName} as DocTypeId {classifyResult.Value.Id}.");
                 }
 
                 if (items.Count > 0)
@@ -388,7 +371,7 @@ namespace EMF.Mail.Services
             if (remaining.Count == 0)
             {
                 await conv.AppendItemAsync(bridge.ConvNo, "assistant", "All required items received.");
-                await mail.ForwardAsync(message.Id!, account.AdmAcctEMail, $"RFI reply processed for PkgNo {bridge.PkgNo}: all required items received.");
+                await mail.ForwardAsync(message.ProvMsgId, account.AdmAcctEMail, $"RFI reply processed for PkgNo {bridge.PkgNo}: all required items received.");
                 await mailDataSvc.FinalizeMessageAsync(new MessageFinalize { MsgNo = msgNo, MsgTpCode = "SUB", IReqNo = bridge.IReqNo, ResTpCode = "OK", MsgResult = "RFI resolved, all items received." });
                 Tracker.Track($"IReqNo {bridge.IReqNo}: all items received, closed.");
             }
@@ -396,7 +379,7 @@ namespace EMF.Mail.Services
             {
                 var stillMissing = string.Join("; ", remaining.Select(t => t.Task));
                 await conv.AppendItemAsync(bridge.ConvNo, "assistant", $"Still missing after reply: {stillMissing}.");
-                await mail.ForwardAsync(message.Id!, account.AdmAcctEMail, $"RFI reply processed for PkgNo {bridge.PkgNo}, but {remaining.Count} item(s) still outstanding: {stillMissing}. This request will not be re-asked automatically -- please follow up.");
+                await mail.ForwardAsync(message.ProvMsgId, account.AdmAcctEMail, $"RFI reply processed for PkgNo {bridge.PkgNo}, but {remaining.Count} item(s) still outstanding: {stillMissing}. This request will not be re-asked automatically -- please follow up.");
                 await mailDataSvc.FinalizeMessageAsync(new MessageFinalize { MsgNo = msgNo, MsgTpCode = "SUB", IReqNo = bridge.IReqNo, ResTpCode = "REVIEW", MsgResult = $"{remaining.Count} item(s) still outstanding after RFI reply; closed without re-asking, admin notified." });
                 Tracker.Track($"IReqNo {bridge.IReqNo}: {remaining.Count} item(s) still outstanding after reply, closed (no re-ask), admin notified.");
             }
@@ -404,7 +387,7 @@ namespace EMF.Mail.Services
 
         // Reprocesses one previously-held message after its vendor link is approved -- reuses the
         // classification saved in MsgContext at hold time instead of re-running Claude.
-        private async Task ReprocessHeldMessageAsync(MailAccount account, GraphMailService mail, HeldMessage heldMsg, int senderId)
+        private async Task ReprocessHeldMessageAsync(MailAccount account, IMailService mail, HeldMessage heldMsg, int senderId)
         {
             var orig = await mail.GetMessageByIdAsync(heldMsg.MsgId);
             if (orig is null)
@@ -427,8 +410,8 @@ namespace EMF.Mail.Services
 
             if (triageResult is null)
             {
-                await mail.MarkNeedsReviewAsync(orig.Id!);
-                await mail.ForwardAsync(orig.Id!, account.AdmAcctEMail, "This message's saved classification could not be read and needs manual review.");
+                await mail.MarkNeedsReviewAsync(orig.ProvMsgId);
+                await mail.ForwardAsync(orig.ProvMsgId, account.AdmAcctEMail, "This message's saved classification could not be read and needs manual review.");
                 await mailDataSvc.FinalizeMessageAsync(new MessageFinalize { MsgNo = heldMsg.MsgNo, ResTpCode = "REVIEW", MsgResult = "Saved MsgContext missing or unreadable on reprocess." });
                 Tracker.Track($"MsgNo {heldMsg.MsgNo}: saved MsgContext missing or unreadable on reprocess.");
                 return;
@@ -440,51 +423,49 @@ namespace EMF.Mail.Services
         // Handles one admin reply: match it to a held message, interpret APPROVE/REJECT, act on it, and
         // fan out to every other message the sender has pending. Every admin message gets its own logged
         // row and a reply -- no path here leaves the admin without a response.
-        private async Task ProcessAdminReplyAsync(MailAccount account, GraphMailService mail, GraphMessage message)
+        private async Task ProcessAdminReplyAsync(MailAccount account, IMailService mail, Message message)
         {
-            var fromAddr = message.From?.EmailAddress?.Address ?? "";
-            var msgId = message.InternetMessageId ?? message.Id!;
+            var msgId = message.InternetMessageId ?? message.ProvMsgId;
 
             var msgResult = await mailDataSvc.SaveMessageAsync(new MailMessage
             {
                 AcctId = account.AcctId,
                 MsgId = msgId,
-                FromAddr = fromAddr,
-                FromName = message.From?.EmailAddress?.Name ?? "",
-                RcptDate = message.ReceivedDateTime?.DateTime ?? DateTime.UtcNow,
-                Subject = message.Subject ?? "",
-                OrigMsgId = GraphMailService.GetOrigMsgId(message)
+                FromAddr = message.FromAddr,
+                FromName = message.FromName,
+                RcptDate = message.ReceivedDateTime,
+                Subject = message.Subject,
+                OrigMsgId = message.OrigMsgId
             });
 
             if (msgResult.IsFailure)
             {
                 if (msgResult.Code == "2627")
-                    Tracker.Track($"{fromAddr}: admin message already logged, skipping.");
+                    Tracker.Track($"{message.FromAddr}: admin message already logged, skipping.");
                 else
-                    Tracker.Track($"{fromAddr}: failed to log admin message ({msgResult.Message}).");
+                    Tracker.Track($"{message.FromAddr}: failed to log admin message ({msgResult.Message}).");
                 return;
             }
 
             var adminMsgNo = msgResult.Value.MsgNo;
 
-            var bridgeMsgIds = GraphMailService.GetBridgeMsgIds(message);
-            var held = (await mailDataSvc.GetHeldBridgeAsync(bridgeMsgIds)).FirstOrDefault();
+            var held = (await mailDataSvc.GetHeldBridgeAsync(message.BridgeMsgIds)).FirstOrDefault();
 
             if (held is null)
             {
-                await mail.ReplyAsync(message.Id!, "This reply doesn't correspond to a message currently on hold -- there's nothing to act on.");
+                await mail.ReplyAsync(message.ProvMsgId, "This reply doesn't correspond to a message currently on hold -- there's nothing to act on.");
                 await mailDataSvc.FinalizeMessageAsync(new MessageFinalize { MsgNo = adminMsgNo, MsgTpCode = "CMD", ResTpCode = "REVIEW", MsgResult = "No matching hold found." });
-                Tracker.Track($"Admin message from {fromAddr}: no matching hold.");
+                Tracker.Track($"Admin message from {message.FromAddr}: no matching hold.");
                 return;
             }
 
-            Tracker.Track($"Admin reply from {fromAddr} matched held MsgNo {held.MsgNo}.");
+            Tracker.Track($"Admin reply from {message.FromAddr} matched held MsgNo {held.MsgNo}.");
 
-            var cmdResult = await cmdSvc.InterpretApprovalReplyAsync(message.Subject ?? "", message.UniqueBody?.Content ?? message.Body?.Content ?? "", held.CandVendName);
+            var cmdResult = await cmdSvc.InterpretApprovalReplyAsync(message.Subject, message.UniqueBody, held.CandVendName);
 
             if (cmdResult.IsFailure)
             {
-                await mail.ReplyAsync(message.Id!, "Something went wrong interpreting that reply. Please try again.");
+                await mail.ReplyAsync(message.ProvMsgId, "Something went wrong interpreting that reply. Please try again.");
                 await mailDataSvc.FinalizeMessageAsync(new MessageFinalize { MsgNo = adminMsgNo, MsgTpCode = "CMD", ResTpCode = "FAILED", MsgResult = $"Claude command interpretation failed: {cmdResult.Message}" });
                 Tracker.Track($"MsgNo {held.MsgNo}: Claude command interpretation failed ({cmdResult.Message}).");
                 return;
@@ -494,7 +475,7 @@ namespace EMF.Mail.Services
             // treated as "didn't understand," never silently folded into a REJECT.
             if (cmdResult.Value.CmdCode != "APPROVE" && cmdResult.Value.CmdCode != "REJECT")
             {
-                await mail.ReplyAsync(message.Id!, "Sorry, I couldn't understand that reply. Please reply APPROVE, REJECT, or the correct vendor name.");
+                await mail.ReplyAsync(message.ProvMsgId, "Sorry, I couldn't understand that reply. Please reply APPROVE, REJECT, or the correct vendor name.");
                 await mailDataSvc.FinalizeMessageAsync(new MessageFinalize { MsgNo = adminMsgNo, MsgTpCode = "CMD", ResTpCode = "REVIEW", MsgResult = "Admin reply did not resolve to APPROVE/REJECT." });
                 Tracker.Track($"MsgNo {held.MsgNo}: admin reply did not resolve to APPROVE/REJECT, left on hold.");
                 return;
@@ -508,7 +489,7 @@ namespace EMF.Mail.Services
                 var matches = await mailDataSvc.LookupVendorAsync(cmdResult.Value.VendorName);
                 if (matches.Count != 1)
                 {
-                    await mail.ReplyAsync(message.Id!, $"Vendor \"{cmdResult.Value.VendorName}\" not found. Please reply with the exact vendor name.");
+                    await mail.ReplyAsync(message.ProvMsgId, $"Vendor \"{cmdResult.Value.VendorName}\" not found. Please reply with the exact vendor name.");
                     await mailDataSvc.FinalizeMessageAsync(new MessageFinalize { MsgNo = adminMsgNo, MsgTpCode = "CMD", ResTpCode = "REVIEW", MsgResult = $"Vendor \"{cmdResult.Value.VendorName}\" not found (or ambiguous)." });
                     Tracker.Track($"MsgNo {held.MsgNo}: vendor \"{cmdResult.Value.VendorName}\" not found (or ambiguous), left on hold.");
                     return;
@@ -518,7 +499,7 @@ namespace EMF.Mail.Services
 
             if (vendId is null)
             {
-                await mail.ReplyAsync(message.Id!, "Please reply with the vendor name to link this sender to.");
+                await mail.ReplyAsync(message.ProvMsgId, "Please reply with the vendor name to link this sender to.");
                 await mailDataSvc.FinalizeMessageAsync(new MessageFinalize { MsgNo = adminMsgNo, MsgTpCode = "CMD", ResTpCode = "REVIEW", MsgResult = "No vendor could be resolved." });
                 Tracker.Track($"MsgNo {held.MsgNo}: no vendor could be resolved, left on hold.");
                 return;
@@ -535,7 +516,7 @@ namespace EMF.Mail.Services
                 var linkResult = await mailDataSvc.LinkVendorAsync(held.SenderId, account.AppId, vendId.Value);
                 if (linkResult.IsFailure)
                 {
-                    await mail.ReplyAsync(message.Id!, "Something went wrong linking this vendor. Please try again or contact support.");
+                    await mail.ReplyAsync(message.ProvMsgId, "Something went wrong linking this vendor. Please try again or contact support.");
                     await mailDataSvc.FinalizeMessageAsync(new MessageFinalize { MsgNo = adminMsgNo, MsgTpCode = "CMD", ResTpCode = "FAILED", MsgResult = $"Failed to link vendor: {linkResult.Message}" });
                     Tracker.Track($"MsgNo {held.MsgNo}: failed to link VendId {vendId} to SenderId {held.SenderId} ({linkResult.Message}).");
                     return;
@@ -555,13 +536,13 @@ namespace EMF.Mail.Services
                 ResultMsg = isApproved ? "Approved" : "Rejected"
             });
 
-            Tracker.Track($"{fromAddr}: {(isApproved ? "approved" : "rejected")} VendId {vendId} -- {pending.Count} message(s) affected.");
+            Tracker.Track($"{message.FromAddr}: {(isApproved ? "approved" : "rejected")} VendId {vendId} -- {pending.Count} message(s) affected.");
 
             if (isApproved)
                 foreach (var heldMsg in pending)
                     await ReprocessHeldMessageAsync(account, mail, heldMsg, held.SenderId);
 
-            await mail.ReplyAsync(message.Id!, isApproved
+            await mail.ReplyAsync(message.ProvMsgId, isApproved
                 ? $"Approved. {pending.Count} message(s) for this vendor were processed."
                 : $"Rejected. {pending.Count} message(s) were declined.");
 
@@ -610,11 +591,10 @@ namespace EMF.Mail.Services
             return string.Join(" ", lines);
         }
 
-        public async Task ProcessAccountAsync(MailAccount account)
+        // mail is now supplied by the caller (Program.cs), constructed there per account's ProvCode --
+        // this method no longer knows or cares which provider implementation it's talking to.
+        public async Task ProcessAccountAsync(MailAccount account, IMailService mail)
         {
-            var clientSecret = config[$"MailSecrets:{account.SecretName}"] ?? throw new InvalidOperationException($"Secret '{account.SecretName}' not found in configuration.");
-            var mail = new GraphMailService(account, clientSecret);
-
             var (process, docTypes) = await filerDataSvc.GetProcessAndDocTypesAsync(account.AppId);
 
             // One call for the whole app (not one per doc type) -- GetDocTypeFieldsByAppAsync returns every
@@ -641,11 +621,9 @@ namespace EMF.Mail.Services
 
             foreach (var message in messages)
             {
-                var fromAddr = message.From?.EmailAddress?.Address ?? "";
-
                 try
                 {
-                    if (string.Equals(fromAddr, account.AdmAcctEMail, StringComparison.OrdinalIgnoreCase))
+                    if (string.Equals(message.FromAddr, account.AdmAcctEMail, StringComparison.OrdinalIgnoreCase))
                     {
                         await ProcessAdminReplyAsync(account, mail, message);
                     }
@@ -653,8 +631,7 @@ namespace EMF.Mail.Services
                     {
                         // Checked before normal classification -- a reply to an open RFI takes this path
                         // instead of being triaged again as a fresh Submission/Inquiry.
-                        var bridgeMsgIds = GraphMailService.GetBridgeMsgIds(message);
-                        var rfiBridge = (await mailDataSvc.GetRfiBridgeAsync(bridgeMsgIds)).FirstOrDefault();
+                        var rfiBridge = (await mailDataSvc.GetRfiBridgeAsync(message.BridgeMsgIds)).FirstOrDefault();
 
                         if (rfiBridge is not null)
                             await ProcessInfoRequestReplyAsync(account, mail, message, rfiBridge, docTypes, process?.ProcessDesc ?? "");
@@ -664,11 +641,10 @@ namespace EMF.Mail.Services
                 }
                 catch (Exception ex)
                 {
-                    Tracker.Track($"{fromAddr}: unhandled exception processing message ({ex.Message}).");
+                    Tracker.Track($"{message.FromAddr}: unhandled exception processing message ({ex.Message}).");
                 }
             }
 
-            var newWatermark = messages.Count > 0 ? messages.Max(m => m.ReceivedDateTime?.DateTime ?? DateTime.UtcNow) : DateTime.UtcNow;
             var pollResult = await mailDataSvc.SetLastPollAsync(new AccountPoll { AcctId = account.AcctId, LastPollDT = DateTime.UtcNow, LastMsgLink = deltaLink });
             if (pollResult.IsFailure)
                 Tracker.Track($"Account {account.AcctName}: failed to update LastPollDT/LastMsgLink ({pollResult.Message}).");

@@ -11,6 +11,7 @@ namespace EMF.Mail.Models
         public string AcctName { get; set; } = string.Empty;
         public string AdmAcctEMail { get; set; } = string.Empty;
         public string GetSenderHistHndName { get; set; } = string.Empty;
+        public string ProvCode { get; set; } = string.Empty;
         public string TenantId { get; set; } = string.Empty;
         public string ClientId { get; set; } = string.Empty;
         public string SecretName { get; set; } = string.Empty;
@@ -22,6 +23,28 @@ namespace EMF.Mail.Models
         public int UId { get; set; }
         public int? EntId { get; set; }
         public bool IsAdmin { get; set; }
+    }
+
+    // Provider-agnostic inbound message, mapped from whatever the underlying mail provider returns
+    // (GraphMailService maps from Microsoft.Graph.Models.Message) so MessageProcessor never touches a
+    // provider SDK type directly. ProvMsgId is the provider's own opaque message id (Graph's Id) --
+    // used only to make further provider calls (reply/forward/flag/mark-review/send) against this same
+    // message, never persisted. InternetMessageId is the RFC5322 id that IS persisted (msg.TblMessages.MsgId).
+    // OrigMsgId/BridgeMsgIds are computed by the provider from its own header mechanics at mapping time,
+    // so no raw header list needs to flow through MessageProcessor either.
+    public class Message
+    {
+        public string ProvMsgId { get; set; } = string.Empty;
+        public string? InternetMessageId { get; set; }
+        public string FromAddr { get; set; } = string.Empty;
+        public string FromName { get; set; } = string.Empty;
+        public DateTime ReceivedDateTime { get; set; }
+        public string Subject { get; set; } = string.Empty;
+        public string Body { get; set; } = string.Empty;
+        public string UniqueBody { get; set; } = string.Empty;
+        public List<AttachmentContent> Attachments { get; set; } = [];
+        public string? OrigMsgId { get; set; }
+        public List<string> BridgeMsgIds { get; set; } = [];
     }
 
     public class MailMessage
@@ -158,9 +181,9 @@ namespace EMF.Mail.Models
         public int? ReqUId { get; set; }
         public int ConvNo { get; set; }
     }
-    public class InfoRequestOpenResult 
-    { 
-        public int IReqNo { get; set; } 
+    public class InfoRequestOpenResult
+    {
+        public int IReqNo { get; set; }
     }
     // Payload for /filer/msg/finalize -- single write-back point for a message's terminal state. Null
     // fields leave the corresponding column untouched (see the proc). IReqNo absorbs what used to be a
