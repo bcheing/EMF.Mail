@@ -64,6 +64,17 @@ namespace EMF.Mail.Models
         public int PkgNo { get; set; }
         public int DocNo { get; set; }
     }
+    public class MsgType
+    {
+        public int MsgTpId { get; set; }
+        public string MsgTpCode { get; set; } = string.Empty;
+        public string MsgTpDesc { get; set; } = string.Empty;
+        public string? PutHndName { get; set; }
+        public string? GetHndName { get; set; }
+        public string? ClassifyHint { get; set; }
+        public string? HandlingPrompt { get; set; }
+        public string? ReplyPrompt { get; set; }
+    }
     public class MessageResult { public int MsgNo { get; set; } public int SenderId { get; set; } }
 
     // Result of /msg/mail/held -- resolves an admin reply back to the message it was forwarded from,
@@ -191,7 +202,7 @@ namespace EMF.Mail.Models
     public class MessageFinalize
     {
         public int MsgNo { get; set; }
-        public TriageResult? MsgContext { get; set; }
+        public object? MsgContext { get; set; }
         public string? MsgTpCode { get; set; }
         public bool? IsHeld { get; set; }
         public string? FwdMsgId { get; set; }

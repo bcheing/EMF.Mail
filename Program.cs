@@ -38,12 +38,13 @@ public static class Program
         var triageSvc = new TriageService(claude, db, classifier);
         var cmdSvc = new CommandService(claude);
         var filerDataSvc = new FilerDataService(db);
-        var dms = new PkgService(db);
-        var filer = new Filer(filerDataSvc, classifier, dms);
+        var pkgSvc = new PkgService(db);
+        var filer = new Filer(filerDataSvc, classifier, pkgSvc);
         var mailDataSvc = new MailDataService(db);
-        var conv = new ConversationService(db);
+        var convSvc = new ConversationService(db);
 
-        var processor = new MessageProcessor(mailDataSvc, filerDataSvc, triageSvc, cmdSvc, classifier, filer, conv);
+        var processor = new MessageProcessor(mailDataSvc, filerDataSvc, triageSvc, cmdSvc, classifier, filer, convSvc);
+        var msgTypeProcessor = new MsgTypeProcessor(mailDataSvc, filerDataSvc, classifier);
 
         while (true)
         {
@@ -60,7 +61,10 @@ public static class Program
                     _ => throw new InvalidOperationException($"Account {account.AcctName}: unsupported ProvCode '{account.ProvCode}'.")
                 };
 
-                await processor.ProcessAccountAsync(account, mail);
+                if (account.AppId == 12)
+                    await processor.ProcessAccountAsync(account, mail);
+                else
+                    await msgTypeProcessor.ProcessAccountAsync(account, mail);
             }
 
             await Task.Delay(TimeSpan.FromMinutes(1));
