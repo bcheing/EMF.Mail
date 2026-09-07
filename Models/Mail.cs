@@ -9,15 +9,21 @@ namespace EMF.Mail.Models
         public int AppId { get; set; }
         public int OwnerUId { get; set; }
         public string AcctName { get; set; } = string.Empty;
+        public string SecretName { get; set; } = string.Empty;
         public string AdmAcctEMail { get; set; } = string.Empty;
         public string GetSenderHistHndName { get; set; } = string.Empty;
         public string ProvCode { get; set; } = string.Empty;
         public string TenantId { get; set; } = string.Empty;
         public string ClientId { get; set; } = string.Empty;
-        public string SecretName { get; set; } = string.Empty;
+        public string? ImapHost { get; set; }
+        public int? ImapPort { get; set; }
+        public string? SmtpHost { get; set; }
+        public int? SmtpPort { get; set; }
         public DateTime LastPollDT { get; set; }
         public string? LastMsgLink { get; set; }
     }
+    public record GraphAccount(string AcctName, string TenantId, string ClientId);
+    public record ImapAccount(string AcctName, string ImapHost, int ImapPort, string SmtpHost, int SmtpPort);
     public class AppUser
     {
         public int UId { get; set; }
@@ -58,7 +64,6 @@ namespace EMF.Mail.Models
         public string? OrigMsgId { get; set; }
         // Opaque json (see MessageFinalize.MsgContext below) -- widened from TriageResult? now that a
         // message's classification may be a Cheing.Net.Ai.ClassifyResult for any app, not just AP's.
-        public object? MsgContext { get; set; }
     }
     public class MessageItem
     {

@@ -32,7 +32,6 @@ namespace EMF.Mail.Services
         public Task<Result<InfoRequestOpenResult>> OpenInfoRequestAsync(InfoRequest rfi) => db.PutObjAsync<InfoRequestOpenResult>(new { HndName = "/msg/req/open", rfi });
         public Task<Result> ResendInfoRequestAsync(int iReqNo, string sentMsgId) => db.PutAsync(new { HndName = "/msg/req/resend", IReqNo = iReqNo, SentMsgId = sentMsgId }); // for future use
         public Task<Result> CloseInfoRequestAsync(int iReqNo) => db.PutAsync(new { HndName = "/msg/req/close", IReqNo = iReqNo });
-        public Task<Result> LinkReplyAsync(int msgNo, int iReqNo) => db.PutAsync(new { HndName = "/filer/msg/linkreply", MsgNo = msgNo, IReqNo = iReqNo }); // correlation only, not terminal state
         public Task<Result<PutRequestResult>> PutRecordAsync(string hndName, Dictionary<string, object> fields) => db.PutObjAsync<PutRequestResult>(new { HndName = hndName, req = fields });
     }
 }

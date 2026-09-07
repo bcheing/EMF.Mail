@@ -2,7 +2,6 @@ using Azure.Identity;
 using EMF.FilerSvc;
 using EMF.Mail.Models;
 using Microsoft.Graph;
-using Microsoft.Graph.Users.Item.MailFolders.Item.Messages;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -20,36 +19,20 @@ namespace EMF.Mail.Services
     {
         private readonly GraphServiceClient _graph;
         private readonly string _mailboxUpn;
+        private const string GraphBaseUrl = "https://graph.microsoft.com/v1.0";
 
-        public GraphMailService(MailAccount account, string clientSecret)
+        public GraphMailService(GraphAccount account, string clientSecret)
         {
             var credential = new ClientSecretCredential(account.TenantId, account.ClientId, clientSecret);
             _graph = new GraphServiceClient(credential);
             _mailboxUpn = account.AcctName;
         }
-        private const string GraphBaseUrl = "https://graph.microsoft.com/v1.0";
 
         // Maps a Graph SDK message into the provider-agnostic Message -- OrigMsgId/BridgeMsgIds are
         // resolved here, from Graph's own header mechanics, so MessageProcessor never touches a raw
         // header list. A future provider resolves the same two fields however its own library exposes
         // In-Reply-To/References.
-        private static Message MapMessage(GraphMessage message) => new()
-        {
-            ProvMsgId = message.Id ?? "",
-            InternetMessageId = message.InternetMessageId,
-            FromAddr = message.From?.EmailAddress?.Address ?? "",
-            FromName = message.From?.EmailAddress?.Name ?? "",
-            ReceivedDateTime = message.ReceivedDateTime?.DateTime ?? DateTime.UtcNow,
-            Subject = message.Subject ?? "",
-            Body = message.Body?.Content ?? "",
-            UniqueBody = message.UniqueBody?.Content ?? message.Body?.Content ?? "",
-            Attachments = (message.Attachments?.OfType<FileAttachment>() ?? [])
-                .Where(a => a.ContentBytes is not null)
-                .Select(a => new AttachmentContent(a.Name ?? "", a.ContentBytes!, Filer.GetMediaType(a.Name ?? "")))
-                .ToList(),
-            OrigMsgId = GetOrigMsgId(message),
-            BridgeMsgIds = GetBridgeMsgIds(message)
-        };
+        
 
         // Delta query replaces the old timestamp-watermark poll. Bootstrap round (lastMsgLink null) hand-builds
         // the initial request URL rather than using the typed QueryParameters -- the v5 SDK has no typed property
@@ -85,11 +68,90 @@ namespace EMF.Mail.Services
 
             return (messages.Select(MapMessage).ToList(), result?.OdataDeltaLink ?? lastMsgLink ?? "");
         }
-
         // In-Reply-To is a standard RFC 5322 header -- provider-agnostic, unlike Graph's own conversationId.
-        private static string? GetOrigMsgId(GraphMessage message) =>
-            message.InternetMessageHeaders?.FirstOrDefault(h => h.Name?.Equals("In-Reply-To", StringComparison.OrdinalIgnoreCase) == true)?.Value;
 
+
+        // Used to reprocess an originally-held message after admin approval -- the message itself was
+        // never staged, so this is a direct filtered lookup (not a sweep) via the MsgId saved at hold time.
+        public async Task<Message?> GetMessageByIdAsync(string internetMessageId)
+        {
+            var result = await _graph.Users[_mailboxUpn].Messages.GetAsync(cfg =>
+            {
+                cfg.QueryParameters.Filter = $"internetMessageId eq '{internetMessageId}'";
+                cfg.QueryParameters.Expand = ["attachments"];
+                cfg.QueryParameters.Select = ["id", "internetMessageId", "from", "receivedDateTime", "subject", "body", "uniqueBody", "attachments", "internetMessageHeaders"];
+            });
+
+            var message = result?.Value?.FirstOrDefault();
+            return message is null ? null : MapMessage(message);
+        }
+        public Task FlagProcessedAsync(string provMsgId) => _graph.Users[_mailboxUpn].Messages[provMsgId].PatchAsync(new GraphMessage
+        {
+            Flag = new FollowupFlag { FlagStatus = FollowupFlagStatus.Flagged }
+        });
+        public Task MarkNeedsReviewAsync(string provMsgId) => _graph.Users[_mailboxUpn].Messages[provMsgId].PatchAsync(new GraphMessage
+        {
+            Categories = ["NeedsReview"]
+        });
+        public Task ReplyAsync(string provMsgId, string comment) => _graph.Users[_mailboxUpn].Messages[provMsgId].Reply.PostAsync(new() { Comment = comment });
+        public Task ForwardAsync(string provMsgId, string toAddr, string comment) => _graph.Users[_mailboxUpn].Messages[provMsgId].Forward.PostAsync(new()
+        {
+            Comment = comment,
+            ToRecipients = [new Recipient { EmailAddress = new EmailAddress { Address = toAddr } }]
+        });
+        // /forward is fire-and-forget (202, no body) so it can't hand back the sent message's id. createForward
+        // returns the draft as a full message object (id assigned at creation), which we then send explicitly --
+        // that id becomes FwdMsgId, the anchor the admin's reply chain gets matched back against.
+        // comment now varies by call site -- whether Claude proposed a candidate vendor or not -- instead of
+        // being a single hardcoded sentence.
+        public async Task<string?> SendApprovalRequestAsync(string provMsgId, string toAddr, string comment)
+        {
+            var draft = await _graph.Users[_mailboxUpn].Messages[provMsgId].CreateForward.PostAsync(new()
+            {
+                Comment = comment,
+                ToRecipients = [new Recipient { EmailAddress = new EmailAddress { Address = toAddr } }]
+            });
+
+            if (draft?.Id is null) return null;
+
+            await _graph.Users[_mailboxUpn].Messages[draft.Id].Send.PostAsync();
+
+            return draft.InternetMessageId;
+        }
+        // Same capture problem as SendApprovalRequestAsync, same fix -- /reply is fire-and-forget too, so
+        // an RFI (the ask for missing attachments) uses createReply+send instead, to capture the sent
+        // message's own InternetMessageId as msg.TblInfoRequests.SentMsgId, the bridge target for whichever
+        // reply the vendor eventually sends back.
+        public async Task<string?> SendInfoRequestAsync(string provMsgId, string comment)
+        {
+            var draft = await _graph.Users[_mailboxUpn].Messages[provMsgId].CreateReply.PostAsync(new() { Comment = comment });
+
+            if (draft?.Id is null) return null;
+
+            await _graph.Users[_mailboxUpn].Messages[draft.Id].Send.PostAsync();
+
+            return draft.InternetMessageId;
+        }
+
+        #region Private methods
+        private static Message MapMessage(GraphMessage message) => new()
+        {
+            ProvMsgId = message.Id ?? "",
+            InternetMessageId = message.InternetMessageId,
+            FromAddr = message.From?.EmailAddress?.Address ?? "",
+            FromName = message.From?.EmailAddress?.Name ?? "",
+            ReceivedDateTime = message.ReceivedDateTime?.DateTime ?? DateTime.UtcNow,
+            Subject = message.Subject ?? "",
+            Body = message.Body?.Content ?? "",
+            UniqueBody = message.UniqueBody?.Content ?? message.Body?.Content ?? "",
+            Attachments = (message.Attachments?.OfType<FileAttachment>() ?? [])
+                .Where(a => a.ContentBytes is not null)
+                .Select(a => new AttachmentContent(a.Name ?? "", a.ContentBytes!, Filer.GetMediaType(a.Name ?? "")))
+                .ToList(),
+            OrigMsgId = GetOrigMsgId(message),
+            BridgeMsgIds = GetBridgeMsgIds(message)
+        };
+        private static string? GetOrigMsgId(GraphMessage message) => message.InternetMessageHeaders?.FirstOrDefault(h => h.Name?.Equals("In-Reply-To", StringComparison.OrdinalIgnoreCase) == true)?.Value;
         // References accumulates every ancestor's Message-ID as a thread grows (parent's References + parent's
         // Message-ID, per RFC 5322 3.6.4), so the first entry is always the root message no matter how many
         // replies deep -- this is what lets an admin's Nth reply still resolve back to the original hold
@@ -114,73 +176,6 @@ namespace EMF.Mail.Services
 
             return candidates;
         }
-
-        // Used to reprocess an originally-held message after admin approval -- the message itself was
-        // never staged, so this is a direct filtered lookup (not a sweep) via the MsgId saved at hold time.
-        public async Task<Message?> GetMessageByIdAsync(string internetMessageId)
-        {
-            var result = await _graph.Users[_mailboxUpn].Messages.GetAsync(cfg =>
-            {
-                cfg.QueryParameters.Filter = $"internetMessageId eq '{internetMessageId}'";
-                cfg.QueryParameters.Expand = ["attachments"];
-                cfg.QueryParameters.Select = ["id", "internetMessageId", "from", "receivedDateTime", "subject", "body", "uniqueBody", "attachments", "internetMessageHeaders"];
-            });
-
-            var message = result?.Value?.FirstOrDefault();
-            return message is null ? null : MapMessage(message);
-        }
-
-        public Task FlagProcessedAsync(string provMsgId) => _graph.Users[_mailboxUpn].Messages[provMsgId].PatchAsync(new GraphMessage
-        {
-            Flag = new FollowupFlag { FlagStatus = FollowupFlagStatus.Flagged }
-        });
-
-        public Task MarkNeedsReviewAsync(string provMsgId) => _graph.Users[_mailboxUpn].Messages[provMsgId].PatchAsync(new GraphMessage
-        {
-            Categories = ["NeedsReview"]
-        });
-
-        public Task ReplyAsync(string provMsgId, string comment) => _graph.Users[_mailboxUpn].Messages[provMsgId].Reply.PostAsync(new() { Comment = comment });
-
-        public Task ForwardAsync(string provMsgId, string toAddr, string comment) => _graph.Users[_mailboxUpn].Messages[provMsgId].Forward.PostAsync(new()
-        {
-            Comment = comment,
-            ToRecipients = [new Recipient { EmailAddress = new EmailAddress { Address = toAddr } }]
-        });
-
-        // /forward is fire-and-forget (202, no body) so it can't hand back the sent message's id. createForward
-        // returns the draft as a full message object (id assigned at creation), which we then send explicitly --
-        // that id becomes FwdMsgId, the anchor the admin's reply chain gets matched back against.
-        // comment now varies by call site -- whether Claude proposed a candidate vendor or not -- instead of
-        // being a single hardcoded sentence.
-        public async Task<string?> SendApprovalRequestAsync(string provMsgId, string toAddr, string comment)
-        {
-            var draft = await _graph.Users[_mailboxUpn].Messages[provMsgId].CreateForward.PostAsync(new()
-            {
-                Comment = comment,
-                ToRecipients = [new Recipient { EmailAddress = new EmailAddress { Address = toAddr } }]
-            });
-
-            if (draft?.Id is null) return null;
-
-            await _graph.Users[_mailboxUpn].Messages[draft.Id].Send.PostAsync();
-
-            return draft.InternetMessageId;
-        }
-
-        // Same capture problem as SendApprovalRequestAsync, same fix -- /reply is fire-and-forget too, so
-        // an RFI (the ask for missing attachments) uses createReply+send instead, to capture the sent
-        // message's own InternetMessageId as msg.TblInfoRequests.SentMsgId, the bridge target for whichever
-        // reply the vendor eventually sends back.
-        public async Task<string?> SendInfoRequestAsync(string provMsgId, string comment)
-        {
-            var draft = await _graph.Users[_mailboxUpn].Messages[provMsgId].CreateReply.PostAsync(new() { Comment = comment });
-
-            if (draft?.Id is null) return null;
-
-            await _graph.Users[_mailboxUpn].Messages[draft.Id].Send.PostAsync();
-
-            return draft.InternetMessageId;
-        }
+        #endregion
     }
 }

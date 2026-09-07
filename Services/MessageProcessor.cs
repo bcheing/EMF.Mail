@@ -223,9 +223,6 @@ namespace EMF.Mail.Services
                 return;
             }
 
-            // Inquiry: this msgtype has a GetHndName (e.g. AP's INQ -> Invoice) -- look up by senderId plus
-            // whatever non-Searchable key fields the entity defines (VendId is Searchable, resolved via
-            // senderId's history already; InvcNbr is the part the sender actually has to supply).
             if (result.MsgTpCode == "INQ")
             {
                 if (msgType.GetHndName is null)
@@ -238,7 +235,9 @@ namespace EMF.Mail.Services
                 var fields = fieldsByMsgType.GetValueOrDefault(msgType.MsgTpId) ?? [];
                 var keyFields = fields.Where(f => f.IsKey && f.FieldMode != "Searchable").ToList();
                 var pkgFields = result.Packages.FirstOrDefault()?.Fields;
-                var keyValues = keyFields.Select(f => (object)(GetFieldString(pkgFields, f.FieldName) ?? "")).ToArray();
+                // Passed through as-is (possibly null) rather than coerced to "" -- an unspecified key should
+                // reach the GetHndName proc as a real NULL, not a literal empty-string filter value.
+                var keyValues = keyFields.Select(f => (object)(GetFieldString(pkgFields, f.FieldName)!)).ToArray();
 
                 var matches = await mailDataSvc.GetRecordsAsync(msgType.GetHndName, new object[] { senderId }.Concat(keyValues).ToArray());
                 var reply = await classifier.ComposeReplyAsync(matches, msgType.ReplyPrompt ?? "Write a short, polite email reply summarizing the information given above, using only the information given.");
@@ -267,6 +266,11 @@ namespace EMF.Mail.Services
             var items = new List<MessageItem>();
             var reqNos = new List<int>();
 
+            // Consumed from this pool (not re-queried against message.Attachments directly) so two attachments
+            // sharing the same FileName -- e.g. three PDFs all named "invoice.pdf" -- can't both resolve to the
+            // same first match; each is claimed at most once.
+            var remainingAttachments = new List<AttachmentContent>(message.Attachments);
+
             foreach (var pkg in result.Packages)
             {
                 var anchor = pkg.Attachments.FirstOrDefault(a => a.IsPackage);
@@ -275,15 +279,14 @@ namespace EMF.Mail.Services
 
                 if (anchor is not null)
                 {
-                    var attachment = message.Attachments.FirstOrDefault(a => a.FileName == anchor.FileName);
+                    var attachment = remainingAttachments.FirstOrDefault(a => a.FileName == anchor.FileName);
                     if (attachment is null)
                     {
                         Tracker.Track($"MsgNo {msgNo}: attachment {anchor.FileName} not found or empty, skipping package.");
                         continue;
                     }
+                    remainingAttachments.Remove(attachment);
 
-                    // Already classified + extracted during triage (known sender, document image was already
-                    // open) -- skip Filer reading the same document a second/third time.
                     var docResult = anchor.DocTpId is not null && anchor.ExtractedFields is not null
                         ? await filer.SaveExtractedDocumentAsync(account.AppId, account.OwnerUId, anchor.DocTpId.Value, anchor.ExtractedFields, attachment.Bytes, anchor.FileName)
                         : await filer.ProcessDocumentAsync(account.AppId, account.OwnerUId, attachment.Bytes, attachment.MediaType, anchor.FileName);
@@ -319,12 +322,13 @@ namespace EMF.Mail.Services
 
                 foreach (var supporting in pkg.Attachments.Where(a => !a.IsPackage))
                 {
-                    var suppAttachment = message.Attachments.FirstOrDefault(a => a.FileName == supporting.FileName);
+                    var suppAttachment = remainingAttachments.FirstOrDefault(a => a.FileName == supporting.FileName);
                     if (suppAttachment is null)
                     {
                         Tracker.Track($"MsgNo {msgNo}: supporting attachment {supporting.FileName} not found or empty, skipping.");
                         continue;
                     }
+                    remainingAttachments.Remove(suppAttachment);
 
                     var attachResult = supporting.DocTpId is not null
                         ? await filer.AttachDocumentAsync(account.AppId, pkgNo, supporting.DocTpId.Value, suppAttachment.Bytes, supporting.FileName)
@@ -354,9 +358,6 @@ namespace EMF.Mail.Services
 
                 await FinalizeAsync(new MessageFinalize { MsgNo = msgNo, MsgContext = context, MsgTpCode = result.MsgTpCode, ResTpCode = "OK" });
 
-                // Gap-checking (ap.sprTblGetTasks) is only meaningful for accounts with a sender-approval
-                // gate configured -- an app with no equivalent concept (e.g. LSM) never had this run, same
-                // as before the redesign; this is a schema-driven check now, not an AppId one.
                 if (!string.IsNullOrEmpty(account.GetSenderHistHndName))
                     await CheckAndRequestMissingDocsAsync(mail, message, message.FromAddr, msgNo, pkgNosCreated);
             }
@@ -366,7 +367,6 @@ namespace EMF.Mail.Services
                 Tracker.Track($"MsgNo {msgNo}: no packages created from this message.");
             }
         }
-
         // Handles one inbound (non-admin) message: log it, classify it, then either hold for approval
         // or process it immediately depending on the link field (e.g. VendId) -- or, for an account with
         // no sender-approval gate configured at all, straight to processing every time.
