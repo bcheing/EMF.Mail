@@ -35,16 +35,16 @@ public static class Program
         var net = new NetBinder(dbConfig);
         var claude = new ClaudeService(net);
         var classifier = new ClaudeClassifier(claude, db);
-        var triageSvc = new TriageService(claude, db, classifier);
         var cmdSvc = new CommandService(claude);
         var filerDataSvc = new FilerDataService(db);
-        var pkgSvc = new PkgService(db);
-        var filer = new Filer(filerDataSvc, classifier, pkgSvc);
+        var dms = new PkgService(db);
+        var filer = new Filer(filerDataSvc, classifier, dms);
         var mailDataSvc = new MailDataService(db);
-        var convSvc = new ConversationService(db);
+        var conv = new ConversationService(db);
 
-        var processor = new MessageProcessor(mailDataSvc, filerDataSvc, triageSvc, cmdSvc, classifier, filer, convSvc);
-        var msgTypeProcessor = new MsgTypeProcessor(mailDataSvc, filerDataSvc, classifier);
+        // One processor for every account, regardless of AppId -- see MessageProcessor for how it reads
+        // sender-approval gating and doc-vs-fields package creation from account/data config instead.
+        var processor = new MessageProcessor(mailDataSvc, filerDataSvc, cmdSvc, classifier, filer, conv);
 
         while (true)
         {
@@ -61,10 +61,7 @@ public static class Program
                     _ => throw new InvalidOperationException($"Account {account.AcctName}: unsupported ProvCode '{account.ProvCode}'.")
                 };
 
-                if (account.AppId == 12)
-                    await processor.ProcessAccountAsync(account, mail);
-                else
-                    await msgTypeProcessor.ProcessAccountAsync(account, mail);
+                await processor.ProcessAccountAsync(account, mail);
             }
 
             await Task.Delay(TimeSpan.FromMinutes(1));

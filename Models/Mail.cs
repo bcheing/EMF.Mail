@@ -56,7 +56,9 @@ namespace EMF.Mail.Models
         public DateTime RcptDate { get; set; }
         public string Subject { get; set; } = string.Empty;
         public string? OrigMsgId { get; set; }
-        public TriageResult? MsgContext { get; set; }
+        // Opaque json (see MessageFinalize.MsgContext below) -- widened from TriageResult? now that a
+        // message's classification may be a Cheing.Net.Ai.ClassifyResult for any app, not just AP's.
+        public object? MsgContext { get; set; }
     }
     public class MessageItem
     {
@@ -75,14 +77,22 @@ namespace EMF.Mail.Models
         public string? HandlingPrompt { get; set; }
         public string? ReplyPrompt { get; set; }
     }
+    // Adds MsgTpId on top of ClaudeFieldSpec -- used only by GetMsgTypeFieldsAsync's batched (whole-app)
+    // read, so the flat result can be grouped by MsgTpId in C#. Mirrors EMF.FilerSvc.Models.DocTypeFieldExt
+    // exactly. How the SQL side actually resolves/shares these field rows behind the scenes is invisible
+    // here -- this class only ever represents "this msgtype's fields", nothing about how they're stored.
+    public class MsgTypeField : Cheing.Net.Ai.ClaudeFieldSpec
+    {
+        public int MsgTpId { get; set; }
+    }
     public class MessageResult { public int MsgNo { get; set; } public int SenderId { get; set; } }
 
     // Result of /msg/mail/held -- resolves an admin reply back to the message it was forwarded from,
     // via References[0]/In-Reply-To matched against the stored FwdMsgId. CandVendId/CandVendName are
     // the candidate Claude proposed at hold time (from MsgContext) -- reused on a bare confirmation
     // reply instead of re-resolving the vendor name from scratch. MsgContext is the raw persisted json
-    // (populated only by /msg/mail/heldbysender) -- deserializes to TriageResult to reuse a message's
-    // original classification on approval, without a second Claude call.
+    // (populated only by /msg/mail/heldbysender) -- deserializes to a Cheing.Net.Ai.ClassifyResult to
+    // reuse a message's original classification on approval, without a second Claude call.
     public class HeldMessage
     {
         public int MsgNo { get; set; }
@@ -91,15 +101,6 @@ namespace EMF.Mail.Models
         public int? CandVendId { get; set; }
         public string? CandVendName { get; set; }
         public string? MsgContext { get; set; }
-    }
-    public class ReqStatus
-    {
-        public int ReqNo { get; set; }
-        public int VendId { get; set; }
-        public string VendName { get; set; } = string.Empty;
-        public string InvcNbr { get; set; } = string.Empty;
-        public string QName { get; set; } = string.Empty;
-        public string QStatus { get; set; } = string.Empty;
     }
 
     // One row per (vendor, doc type) this sender has previously sent for -- a sender linked to more than
@@ -122,41 +123,15 @@ namespace EMF.Mail.Models
         public string? VendorName { get; set; }
     }
 
-    // Full classification output -- also the persisted shape of msg.TblMessages.MsgContext (opaque json,
-    // msg/ai schemas never interpret it) so a held message's original classification survives to approval
-    // without being reclassified.
-    public class TriageResult
-    {
-        public string? MsgTpCode { get; set; }
-        public string? InvcNbr { get; set; }
-        public int? VendId { get; set; }
-        public string? VendName { get; set; }
-        public List<AttachmentLabel> Attachments { get; set; } = [];
-    }
-    // ExtractedFields is only ever populated for a "Processing" attachment on a known sender's Submission --
-    // that's the one case triage already has the document image open (see TriageService), so extraction
-    // happens there instead of Filer reading the same file again later. DocTpId, however, is now set for
-    // Supporting attachments too (typed, not extracted) so ap.sprTblGetTasks can recognize the requirement
-    // as satisfied instead of everything landing under the generic "Misc" doc type.
-    public class AttachmentLabel
-    {
-        public string FileName { get; set; } = string.Empty;
-        public string Label { get; set; } = string.Empty;
-        public string GroupId { get; set; } = string.Empty;
-        public int? DocTpId { get; set; }
-        public Dictionary<string, object>? ExtractedFields { get; set; }
-    }
-
     // Attachment content actually loaded for a Claude call -- replaces the old filenames-only, content-blind
     // approach for classification now that vendor identification may need to read the invoice image itself.
     public record AttachmentContent(string FileName, byte[] Bytes, string MediaType);
 
-    public class EmailReply { public string Body { get; set; } = string.Empty; }
-
     // Result of /ap/pkg/tasks -- one row per outstanding (or already-satisfied) attachment requirement for
     // a package, per its invoice type (ap.LstInvcTypeDocTypes). Same shape DMS's TaskPane consumes; Mail
     // calls the same handler with a list of PkgNo (one submission can create more than one package) so the
-    // gap-check for a whole submission is one round trip, not one per package.
+    // gap-check for a whole submission is one round trip, not one per package. AP-specific -- only called
+    // when the account has a sender-approval gate configured (see MessageProcessor).
     public class PkgTask
     {
         public int PkgNo { get; set; }

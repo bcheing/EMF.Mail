@@ -1,5 +1,6 @@
 using Cheing;
 using Cheing.Net.Ai;
+using EMF.FilerSvc.Models;
 using EMF.Mail.Models;
 using System.Collections.Generic;
 using System.Threading.Tasks;
@@ -12,14 +13,14 @@ namespace EMF.Mail.Services
         // DB Reads
         public Task<List<MailAccount>> GetMailAccountsAsync() => db.GetTListAsync<MailAccount>("/msg/mail/accounts");
         public Task<List<SenderHistory>> GetSenderHistoryAsync(string hndName, int senderId, int appId) => db.GetTListAsync<SenderHistory>(hndName, senderId, appId);
-        public Task<List<ReqStatus>> GetReqStatusAsync(int senderId, string invcNbr) => db.GetTListAsync<ReqStatus>("/msg/mail/requests", senderId, invcNbr);
         public Task<List<HeldMessage>> GetHeldBridgeAsync(List<string> candidateIds) => db.GetTListAsync<HeldMessage>("/msg/mail/heldbridge", candidateIds); // ordered candidate ids (In-Reply-To + References) -- SQL picks the first match, not a C# loop
         public Task<List<HeldMessage>> GetHeldMessagesAsync(int senderId, int? vendId, int anchorMsgNo) => db.GetTListAsync<HeldMessage>("/msg/mail/heldbysender", senderId, vendId, anchorMsgNo); // scoped to one hold cycle + one vendor; vendId nullable, SQL matches unresolved rows regardless
         public Task<List<VendorMatch>> LookupVendorAsync(string nameFragment) => db.GetTListAsync<VendorMatch>("/ap/lookups/vendid", nameFragment);
         public Task<List<PkgTask>> GetPkgTasksAsync(List<int> pkgNos) => db.GetTListAsync<PkgTask>("/ap/pkg/tasks", pkgNos); // gap-check covers every PkgNo in one call; caller filters IsComplete
         public Task<List<RfiBridgeResult>> GetRfiBridgeAsync(List<string> candidateIds) => db.GetTListAsync<RfiBridgeResult>("/msg/mail/rfibridge", candidateIds); // same bridging as GetHeldBridgeAsync, matched against SentMsgId instead of FwdMsgId
         public Task<List<MsgType>> GetMsgTypesAsync(int appId) => db.GetTListAsync<MsgType>("/ai/apps/msgtypes", appId);
-        public Task<List<ClaudeFieldSpec>> GetMsgTypeFieldsAsync(int msgTpId) => db.GetTListAsync<ClaudeFieldSpec>("/ai/apps/msgtypefields", msgTpId);
+        public Task<List<MsgTypeField>> GetMsgTypeFieldsAsync(int appId) => db.GetTListAsync<MsgTypeField>("/ai/apps/msgtypefields", appId);
+        public Task<List<Dictionary<string, object>>> GetRecordsAsync(string hndName, params object[] parameters) => db.GetDictListAsync(hndName, parameters);
 
         // DB Writes
         public Task<Result<MessageResult>> SaveMessageAsync(MailMessage msg) => db.PutObjAsync<MessageResult>(new { HndName = "/filer/msg/message", msg });
@@ -32,6 +33,6 @@ namespace EMF.Mail.Services
         public Task<Result> ResendInfoRequestAsync(int iReqNo, string sentMsgId) => db.PutAsync(new { HndName = "/msg/req/resend", IReqNo = iReqNo, SentMsgId = sentMsgId }); // for future use
         public Task<Result> CloseInfoRequestAsync(int iReqNo) => db.PutAsync(new { HndName = "/msg/req/close", IReqNo = iReqNo });
         public Task<Result> LinkReplyAsync(int msgNo, int iReqNo) => db.PutAsync(new { HndName = "/filer/msg/linkreply", MsgNo = msgNo, IReqNo = iReqNo }); // correlation only, not terminal state
-        public Task<Result> PutMsgTypeInstanceAsync(string hndName, Dictionary<string, object> instance) => db.PutAsync(new { HndName = hndName, req = instance });
+        public Task<Result<PutRequestResult>> PutRecordAsync(string hndName, Dictionary<string, object> fields) => db.PutObjAsync<PutRequestResult>(new { HndName = hndName, req = fields });
     }
 }
