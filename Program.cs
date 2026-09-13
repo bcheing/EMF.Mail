@@ -18,12 +18,13 @@ namespace EMF.Mail;
 public static class Program
 {
 
-    public static async Task Main(string[] args) // args reserved for future CLI arguments (e.g. --account, --since).
+    public static async Task Main()
     {
         var config = new ConfigurationBuilder()
             .SetBasePath(AppContext.BaseDirectory)
             .AddJsonFile("appsettings.json")
             .AddUserSecrets(Assembly.GetExecutingAssembly())
+            .AddEnvironmentVariables()
             .Build();
 
         var dbConfig = config.GetSection("DbConfig").Get<DbConfig>() ?? throw new InvalidOperationException("DbConfig section not found in appsettings.json.");

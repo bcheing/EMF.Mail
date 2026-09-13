@@ -30,7 +30,7 @@ namespace EMF.Mail.Models
         public int? EntId { get; set; }
         public bool IsAdmin { get; set; }
     }
-
+    public class Message
     // Provider-agnostic inbound message, mapped from whatever the underlying mail provider returns
     // (GraphMailService maps from Microsoft.Graph.Models.Message) so MessageProcessor never touches a
     // provider SDK type directly. ProvMsgId is the provider's own opaque message id (Graph's Id) --
@@ -38,7 +38,6 @@ namespace EMF.Mail.Models
     // message, never persisted. InternetMessageId is the RFC5322 id that IS persisted (msg.TblMessages.MsgId).
     // OrigMsgId/BridgeMsgIds are computed by the provider from its own header mechanics at mapping time,
     // so no raw header list needs to flow through MessageProcessor either.
-    public class Message
     {
         public string ProvMsgId { get; set; } = string.Empty;
         public string? InternetMessageId { get; set; }
@@ -52,7 +51,6 @@ namespace EMF.Mail.Models
         public string? OrigMsgId { get; set; }
         public List<string> BridgeMsgIds { get; set; } = [];
     }
-
     public class MailMessage
     {
         public int AcctId { get; set; }
@@ -71,34 +69,18 @@ namespace EMF.Mail.Models
         public int PkgNo { get; set; }
         public int DocNo { get; set; }
     }
-    public class MsgType
-    {
-        public int MsgTpId { get; set; }
-        public string MsgTpCode { get; set; } = string.Empty;
-        public string MsgTpDesc { get; set; } = string.Empty;
-        public string? PutHndName { get; set; }
-        public string? GetHndName { get; set; }
-        public string? ClassifyHint { get; set; }
-        public string? HandlingPrompt { get; set; }
-        public string? ReplyPrompt { get; set; }
+    public class MessageResult 
+    { 
+        public int MsgNo { get; set; } 
+        public int SenderId { get; set; } 
     }
-    // Adds MsgTpId on top of ClaudeFieldSpec -- used only by GetMsgTypeFieldsAsync's batched (whole-app)
-    // read, so the flat result can be grouped by MsgTpId in C#. Mirrors EMF.FilerSvc.Models.DocTypeFieldExt
-    // exactly. How the SQL side actually resolves/shares these field rows behind the scenes is invisible
-    // here -- this class only ever represents "this msgtype's fields", nothing about how they're stored.
-    public class MsgTypeField : Cheing.Net.Ai.ClaudeFieldSpec
-    {
-        public int MsgTpId { get; set; }
-    }
-    public class MessageResult { public int MsgNo { get; set; } public int SenderId { get; set; } }
-
+    public class HeldMessage
     // Result of /msg/mail/held -- resolves an admin reply back to the message it was forwarded from,
     // via References[0]/In-Reply-To matched against the stored FwdMsgId. CandVendId/CandVendName are
     // the candidate Claude proposed at hold time (from MsgContext) -- reused on a bare confirmation
     // reply instead of re-resolving the vendor name from scratch. MsgContext is the raw persisted json
     // (populated only by /msg/mail/heldbysender) -- deserializes to a Cheing.Net.Ai.ClassifyResult to
     // reuse a message's original classification on approval, without a second Claude call.
-    public class HeldMessage
     {
         public int MsgNo { get; set; }
         public int SenderId { get; set; }
@@ -107,17 +89,16 @@ namespace EMF.Mail.Models
         public string? CandVendName { get; set; }
         public string? MsgContext { get; set; }
     }
-
+    public class SenderHistory
     // One row per (vendor, doc type) this sender has previously sent for -- a sender linked to more than
     // one vendor has multiple rows with different VendId. Distinct by VendId/VendName for the linked-vendor set.
-    public class SenderHistory
     {
         public int VendId { get; set; }
         public string VendName { get; set; } = string.Empty;
         public int? DocTypeId { get; set; }
         public int NumDocs { get; set; }
     }
-    public class VendorMatch
+    public class VendorLookup
     {
         public int VendId { get; set; }
         public string VendName { get; set; } = string.Empty;
@@ -127,17 +108,13 @@ namespace EMF.Mail.Models
         public string? CmdCode { get; set; }
         public string? VendorName { get; set; }
     }
-
-    // Attachment content actually loaded for a Claude call -- replaces the old filenames-only, content-blind
-    // approach for classification now that vendor identification may need to read the invoice image itself.
     public record AttachmentContent(string FileName, byte[] Bytes, string MediaType);
-
+    public class PkgTask
     // Result of /ap/pkg/tasks -- one row per outstanding (or already-satisfied) attachment requirement for
     // a package, per its invoice type (ap.LstInvcTypeDocTypes). Same shape DMS's TaskPane consumes; Mail
     // calls the same handler with a list of PkgNo (one submission can create more than one package) so the
     // gap-check for a whole submission is one round trip, not one per package. AP-specific -- only called
     // when the account has a sender-approval gate configured (see MessageProcessor).
-    public class PkgTask
     {
         public int PkgNo { get; set; }
         public int DocTypeId { get; set; }
@@ -145,13 +122,12 @@ namespace EMF.Mail.Models
         public bool IsComplete { get; set; }
         public bool IsOptional { get; set; }
     }
-
+    public class RfiBridgeResult
     // Result of /msg/mail/rfibridge -- resolves a vendor's reply back to the open msg.TblInfoRequests row
     // it's answering, via In-Reply-To/References matched against SentMsgId. SentTo is returned so the
     // caller can confirm the reply's sender matches who the RFI was actually sent to -- sufficient
     // authorization for this one thread even for a sender with no other approval on file (e.g. a
     // freight forwarder), without needing a static whitelist for every ad hoc external party.
-    public class RfiBridgeResult
     {
         public int IReqNo { get; set; }
         public int PkgNo { get; set; }
@@ -159,10 +135,9 @@ namespace EMF.Mail.Models
         public int ConvNo { get; set; }
         public string SentTo { get; set; } = string.Empty;
     }
-
+    public class InfoRequest
     // Payload for /msg/req/open -- ReqUId null means system-generated (the only origin EMF.Mail creates
     // today; NotNo/user-initiated-via-PkgNotify origin is deferred, see ProjectContext).
-    public class InfoRequest
     {
         public int PkgNo { get; set; }
         public int? MsgNo { get; set; }
@@ -176,10 +151,10 @@ namespace EMF.Mail.Models
     {
         public int IReqNo { get; set; }
     }
+    public class MessageFinalization
     // Payload for /filer/msg/finalize -- single write-back point for a message's terminal state. Null
     // fields leave the corresponding column untouched (see the proc). IReqNo absorbs what used to be a
     // separate /filer/msg/linkreply call -- only ever set on the RFI-reply finalize.
-    public class MessageFinalize
     {
         public int MsgNo { get; set; }
         public object? MsgContext { get; set; }
@@ -190,10 +165,9 @@ namespace EMF.Mail.Models
         public string ResTpCode { get; set; } = string.Empty;
         public string? MsgResult { get; set; }
     }
-
+    public class MessageResolution
     // Payload for /filer/msg/resolvecmd -- releases a held sender/vendor batch and logs the admin's
     // APPROVE/REJECT command against msg.TblCommands in one transactional call.
-    public class CommandResolve
     {
         public int SenderId { get; set; }
         public int VendId { get; set; }
@@ -205,9 +179,9 @@ namespace EMF.Mail.Models
         public int ResultCode { get; set; }
         public string? ResultMsg { get; set; }
     }
+    public class AccountBookmark
     // Payload for /filer/msg/lastpoll -- LastPollDT stays as an audit "last run" timestamp; LastMsgLink is
     // the actual delta bookmark now driving what GetChangedMessagesAsync fetches next round.
-    public class AccountPoll
     {
         public int AcctId { get; set; }
         public DateTime LastPollDT { get; set; }
