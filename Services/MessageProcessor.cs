@@ -3,6 +3,7 @@ using Cheing.Net.Ai;
 using EMF.FilerSvc;
 using EMF.FilerSvc.Models;
 using EMF.Mail.Models;
+using HtmlAgilityPack;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -20,9 +21,6 @@ namespace EMF.Mail.Services
     // IsPackage attachment -- both signals already in the data, no hardcoded AppId check needed.
     public partial class MessageProcessor(DataService mailDataSvc, FilerDataService filerDataSvc, CommandService cmdSvc, ClaudeClassifier classifier, Filer filer, ConversationService conv)
     {
-        [GeneratedRegex("<[^>]+>")]
-        private static partial Regex HtmlTagRegex();
-
         [GeneratedRegex(@"\s+")]
         private static partial Regex WhitespaceRegex();
         private static readonly JsonSerializerOptions _jsonOpts = new() { PropertyNameCaseInsensitive = true };
@@ -120,8 +118,15 @@ namespace EMF.Mail.Services
         private static string GetInfoRequestBody(List<PkgTask> gaps) => "We still need additional documentation before your request can be processed: " + string.Join("; ", gaps.Select(g => g.Task)) + ".";
         private static string GetPlainText(string html)
         {
-            var stripped = HtmlTagRegex().Replace(html, " ");
-            var decoded = System.Net.WebUtility.HtmlDecode(stripped);
+            var doc = new HtmlDocument();
+            doc.LoadHtml(html);
+
+            var junk = doc.DocumentNode.SelectNodes("//script|//style|//head");
+            if (junk is not null)
+                foreach (var node in junk)
+                    node.Remove();
+
+            var decoded = System.Net.WebUtility.HtmlDecode(doc.DocumentNode.InnerText);
             return WhitespaceRegex().Replace(decoded, " ").Trim();
         }
         private static string GetApprovalComment(ClassifyResult result, ClaudeFieldSpec linkField, bool isKnownSender, List<string> missingInfo)
