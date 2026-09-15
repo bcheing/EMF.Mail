@@ -19,24 +19,36 @@ namespace EMF.Mail.Services
     // from MailAccount.GetSenderHistHndName (already a per-account config value), and whether a package
     // comes from a document or from Fields alone is decided per PackageInstance by whether it has an
     // IsPackage attachment -- both signals already in the data, no hardcoded AppId check needed.
+    // 
+    // mail is supplied by the caller (Program.cs), constructed there per account's ProvCode -- this
+    // method doesn't know or care which provider implementation it's talking to.
+    // ProcessAccountAsync:
+    // Changed messages are fetched FIRST -- the account's msgtypes/doctypes/field lists are only
+    // fetched at all when there's actually mail to process, since an empty poll (the overwhelming
+    // majority of runs) previously paid for that config every single cycle for no reason. The three
+    // fetches that are needed are independent of each other, so they run via Task.WhenAll rather than
+    // sequential awaits.
+    // GetApprovalComment:
+    // Builds the admin-facing comment for a hold/approval-request email -- echoes what was already
+    // extracted (so approving isn't a blind "trust the sender" click) and calls out anything still
+    // missing, so one reply can both decide and supply the gap instead of a second round-trip.
+    // missingInfo is passed in rather than recomputed -- the caller already needed it for MsgResult.
+    // linkField.Parameter (e.g. "VendName") is the Searchable field's paired display-name field.
+    // GetMissingInfo:
+    // The specific gaps in a classification that should be flagged and drive PARTIAL vs HELD -- terse,
+    // no MsgNo/sender/reference numbers (those are already columns on the same row). The link field
+    // (e.g. VendId) only counts as a gap when the sender is known (isKnownSender): for a first-contact
+    // sender, an unresolved link value is the deliberate outcome of not opening the attachment yet, not
+    // something missing.
     public partial class MessageProcessor(DataService mailDataSvc, FilerDataService filerDataSvc, CommandService cmdSvc, ClaudeClassifier classifier, Filer filer, ConversationService conv)
     {
         private const int ReminderThresholdDays = 7;
-
         [GeneratedRegex(@"\s+")]
         private static partial Regex WhitespaceRegex();
         private static readonly JsonSerializerOptions _jsonOpts = new() { PropertyNameCaseInsensitive = true };
 
         #region Public methods. Main entry point from console app.
         public async Task ProcessAccountAsync(MailAccount account, IMailService mail)
-        // mail is supplied by the caller (Program.cs), constructed there per account's ProvCode -- this
-        // method doesn't know or care which provider implementation it's talking to.
-        //
-        // Changed messages are fetched FIRST -- the account's msgtypes/doctypes/field lists are only
-        // fetched at all when there's actually mail to process, since an empty poll (the overwhelming
-        // majority of runs) previously paid for that config every single cycle for no reason. The three
-        // fetches that are needed are independent of each other, so they run via Task.WhenAll rather than
-        // sequential awaits.
         {
             var (messages, deltaLink) = await mail.GetChangedMessagesAsync(account.LastMsgLink);
             Tracker.Track($"Account {account.AcctName}: {messages.Count} message(s) fetched.");
@@ -132,11 +144,7 @@ namespace EMF.Mail.Services
             return WhitespaceRegex().Replace(decoded, " ").Trim();
         }
         private static string GetApprovalComment(ClassifyResult result, ClaudeFieldSpec linkField, bool isKnownSender, List<string> missingInfo, int numHeldMessages = 0, DateTime? firstHeldMessageDT = null)
-        // Builds the admin-facing comment for a hold/approval-request email -- echoes what was already
-        // extracted (so approving isn't a blind "trust the sender" click) and calls out anything still
-        // missing, so one reply can both decide and supply the gap instead of a second round-trip.
-        // missingInfo is passed in rather than recomputed -- the caller already needed it for MsgResult.
-        // linkField.Parameter (e.g. "VendName") is the Searchable field's paired display-name field.
+        
         {
             var fields = result.Packages.FirstOrDefault()?.Fields;
             var vendId = GetFieldInt(fields, linkField.FieldName);
@@ -162,11 +170,6 @@ namespace EMF.Mail.Services
             return string.Join(" ", lines);
         }
         private static List<string> GetMissingInfo(ClassifyResult result, ClaudeFieldSpec linkField, bool isKnownSender)
-        // The specific gaps in a classification that should be flagged and drive PARTIAL vs HELD -- terse,
-        // no MsgNo/sender/reference numbers (those are already columns on the same row). The link field
-        // (e.g. VendId) only counts as a gap when the sender is known (isKnownSender): for a first-contact
-        // sender, an unresolved link value is the deliberate outcome of not opening the attachment yet, not
-        // something missing.
         {
             var gaps = new List<string>();
 
@@ -184,17 +187,6 @@ namespace EMF.Mail.Services
         #endregion
 
         #region Private processing methods
-        private async Task FinalizeAsync(MessageFinalization finalize)
-        // Every terminal write goes through here instead of calling mailDataSvc.FinalizeMessageAsync
-        // directly -- a failed write here used to be silently swallowed (the caller's own Tracker.Track
-        // line ran regardless, logging a false "success" even when nothing was actually persisted). This
-        // is the fix for that: the intended outcome always gets logged distinctly from whether it was
-        // actually written.
-        {
-            var result = await mailDataSvc.SaveMessageFinalizationAsync(finalize);
-            if (result.IsFailure)
-                Tracker.Track($"MsgNo {finalize.MsgNo}: failed to persist final status ({result.Message}) -- intended ResTpCode '{finalize.ResTpCode}' was NOT written.");
-        }
         private async Task<(Result<ClassifyResult> Result, List<SenderHistory> History, ClaudeFieldSpec? LinkField)> ClassifyMessageAsync(MailAccount account, List<DocType> docTypes, List<MsgType> msgTypes, Dictionary<int, List<ClaudeFieldSpec>> fieldsByMsgType, string processDesc, Message message, int senderId)
         // Builds the classify content + runs it. History/isKnownSender/linkField only matter for accounts
         // with a sender-approval gate configured (GetSenderHistHndName non-empty, e.g. AP's vendor link) --
@@ -321,6 +313,11 @@ namespace EMF.Mail.Services
         // fan-out path (classification is reused from the original hold's saved MsgContext, not re-run).
         // saveContext is false on the fan-out path -- MsgContext was already written when the message was
         // first held, so the finalize call there only needs to touch MsgTpId/ResTpId/IsProcessed, not resave it.
+        // Consumed from this pool (not re-queried against message.Attachments directly) so two attachments
+        // sharing the same FileName -- e.g. three PDFs all named "invoice.pdf" -- can't both resolve to the
+        // same first match; each is claimed at most once.
+        // Passed through as-is (possibly null) rather than coerced to "" -- an unspecified key should
+        // reach the GetHndName proc as a real NULL, not a literal empty-string filter value.
         {
             var context = saveContext ? result : null;
 
@@ -354,8 +351,7 @@ namespace EMF.Mail.Services
                 var fields = fieldsByMsgType.GetValueOrDefault(msgType.MsgTpId) ?? [];
                 var keyFields = fields.Where(f => f.IsKey && f.FieldMode != "Searchable").ToList();
                 var pkgFields = result.Packages.FirstOrDefault()?.Fields;
-                // Passed through as-is (possibly null) rather than coerced to "" -- an unspecified key should
-                // reach the GetHndName proc as a real NULL, not a literal empty-string filter value.
+                
                 var keyValues = keyFields.Select(f => (object)(GetFieldString(pkgFields, f.FieldName)!)).ToArray();
 
                 var matches = await mailDataSvc.GetRecordsAsync(msgType.GetHndName, [senderId, .. keyValues]);
@@ -382,82 +378,9 @@ namespace EMF.Mail.Services
                 return;
             }
 
-            var items = new List<MessageItem>();
-
-            // Consumed from this pool (not re-queried against message.Attachments directly) so two attachments
-            // sharing the same FileName -- e.g. three PDFs all named "invoice.pdf" -- can't both resolve to the
-            // same first match; each is claimed at most once.
-            var remainingAttachments = new List<AttachmentContent>(message.Attachments);
-
-            foreach (var pkg in result.Packages)
-            {
-                var anchor = pkg.Attachments.FirstOrDefault(a => a.IsPackage);
-                int pkgNo;
-                var reqNo = 0;
-
-                if (anchor is not null)
-                {
-                    var attachment = remainingAttachments.FirstOrDefault(a => a.FileName == anchor.FileName);
-                    if (attachment is null)
-                    {
-                        Tracker.Track($"MsgNo {msgNo}: attachment {anchor.FileName} not found or empty, skipping package.");
-                        continue;
-                    }
-                    remainingAttachments.Remove(attachment);
-
-                    var docResult = anchor.DocTpId is not null && anchor.ExtractedFields is not null
-                        ? await filer.SaveExtractedDocumentAsync(account.AppId, account.OwnerUId, anchor.DocTpId.Value, anchor.ExtractedFields, attachment.Bytes, anchor.FileName)
-                        : await filer.ProcessDocumentAsync(account.AppId, account.OwnerUId, attachment.Bytes, attachment.MediaType, anchor.FileName);
-
-                    if (docResult.IsFailure)
-                    {
-                        Tracker.Track($"MsgNo {msgNo}: {docResult.Message}");
-                        continue;
-                    }
-
-                    pkgNo = docResult.Value.PkgNo;
-                    reqNo = docResult.Value.ReqNo;
-                    items.Add(new MessageItem { MsgNo = msgNo, PkgNo = pkgNo, DocNo = docResult.Value.DocNo });
-                    Tracker.Track($"MsgNo {msgNo}: created ReqNo {reqNo} (PkgNo {pkgNo}) from {anchor.FileName}.");
-                }
-                else
-                {
-                    var putResult = await filerDataSvc.SaveRequestAsync(msgType.PutHndName, pkg.Fields);
-                    if (putResult.IsFailure)
-                    {
-                        Tracker.Track($"MsgNo {msgNo}: {putResult.Message}");
-                        continue;
-                    }
-
-                    pkgNo = putResult.Value.PkgNo;
-                    reqNo = putResult.Value.ReqNo;
-                    items.Add(new MessageItem { MsgNo = msgNo, PkgNo = pkgNo, DocNo = putResult.Value.DocNo });
-                    Tracker.Track($"MsgNo {msgNo}: saved {result.MsgTpCode} record (PkgNo {pkgNo}).");
-                }
-
-                foreach (var supporting in pkg.Attachments.Where(a => !a.IsPackage))
-                {
-                    var suppAttachment = remainingAttachments.FirstOrDefault(a => a.FileName == supporting.FileName);
-                    if (suppAttachment is null)
-                    {
-                        Tracker.Track($"MsgNo {msgNo}: supporting attachment {supporting.FileName} not found or empty, skipping.");
-                        continue;
-                    }
-                    remainingAttachments.Remove(suppAttachment);
-
-                    var attachResult = supporting.DocTpId is not null
-                        ? await filer.AttachDocumentAsync(account.AppId, pkgNo, supporting.DocTpId.Value, suppAttachment.Bytes, supporting.FileName)
-                        : await filer.AttachDocumentAsync(pkgNo, suppAttachment.Bytes, supporting.FileName);
-
-                    if (attachResult.IsFailure)
-                    {
-                        Tracker.Track($"MsgNo {msgNo}: {attachResult.Message}");
-                        continue;
-                    }
-
-                    items.Add(new MessageItem { MsgNo = msgNo, PkgNo = pkgNo, DocNo = attachResult.Value });
-                }
-            }
+            var attachmentTuples = message.Attachments.Select(a => (a.FileName, a.Bytes, a.MediaType)).ToList();
+            var created = await filer.SavePackagesAsync(msgNo, account.AppId, account.OwnerUId, msgType, result.MsgTpCode, result.Packages, attachmentTuples);
+            var items = created.Select(c => new MessageItem { MsgNo = msgNo, PkgNo = c.PkgNo, DocNo = c.DocNo }).ToList();
 
             if (items.Count > 0)
                 await mailDataSvc.SaveMessageItemsAsync(items);
@@ -840,6 +763,17 @@ namespace EMF.Mail.Services
                 : $"Rejected. {pending.Count} message(s) were declined.");
 
             await FinalizeAsync(new MessageFinalization { MsgNo = adminMsgNo, MsgTpCode = "CMD", ResTpCode = "OK" });
+        }
+        private async Task FinalizeAsync(MessageFinalization finalize)
+        // Every terminal write goes through here instead of calling mailDataSvc.FinalizeMessageAsync
+        // directly -- a failed write here used to be silently swallowed (the caller's own Tracker.Track
+        // line ran regardless, logging a false "success" even when nothing was actually persisted). This
+        // is the fix for that: the intended outcome always gets logged distinctly from whether it was
+        // actually written.
+        {
+            var result = await mailDataSvc.SaveMessageFinalizationAsync(finalize);
+            if (result.IsFailure)
+                Tracker.Track($"MsgNo {finalize.MsgNo}: failed to persist final status ({result.Message}) -- intended ResTpCode '{finalize.ResTpCode}' was NOT written.");
         }
         #endregion
     }
