@@ -21,6 +21,8 @@ namespace EMF.Mail.Services
     // IsPackage attachment -- both signals already in the data, no hardcoded AppId check needed.
     public partial class MessageProcessor(DataService mailDataSvc, FilerDataService filerDataSvc, CommandService cmdSvc, ClaudeClassifier classifier, Filer filer, ConversationService conv)
     {
+        private const int ReminderThresholdDays = 7;
+
         [GeneratedRegex(@"\s+")]
         private static partial Regex WhitespaceRegex();
         private static readonly JsonSerializerOptions _jsonOpts = new() { PropertyNameCaseInsensitive = true };
@@ -69,7 +71,7 @@ namespace EMF.Mail.Services
                         {
                             // Checked before normal classification -- a reply to an open RFI takes this path
                             // instead of being triaged again as a fresh Submission/Inquiry.
-                            var rfiBridge = (await mailDataSvc.GetRfiBridgeAsync(message.BridgeMsgIds)).FirstOrDefault();
+                            var rfiBridge = await mailDataSvc.GetRfiBridgeAsync(message.BridgeMsgIds);
 
                             if (rfiBridge is not null)
                                 await ProcessInfoRequestReplyAsync(account, mail, message, rfiBridge, docTypes, process?.ProcessDesc ?? "");
@@ -84,7 +86,7 @@ namespace EMF.Mail.Services
                 }
             }
 
-            var pollResult = await mailDataSvc.SaveMessageBookmarkAsync(new AccountBookmark { AcctId = account.AcctId, LastPollDT = DateTime.UtcNow, LastMsgLink = deltaLink });
+            var pollResult = await mailDataSvc.SaveMessageBookmarkAsync(new AccountBookmark { AcctId = account.AcctId, LastMsgLink = deltaLink });
             if (pollResult.IsFailure)
                 Tracker.Track($"Account {account.AcctName}: failed to update LastPollDT/LastMsgLink ({pollResult.Message}).");
         }
@@ -115,7 +117,7 @@ namespace EMF.Mail.Services
                 _ => int.TryParse(value.ToString(), out var p) ? p : null
             };
         }
-        private static string GetInfoRequestBody(List<PkgTask> gaps) => "We still need additional documentation before your request can be processed: " + string.Join("; ", gaps.Select(g => g.Task)) + ".";
+        private static string GetInfoRequestBody(List<PkgTask> gaps) => "We need some additional documentation before we can process your request: " + string.Join("; ", gaps.Select(g => g.Task)) + ".";
         private static string GetPlainText(string html)
         {
             var doc = new HtmlDocument();
@@ -129,7 +131,7 @@ namespace EMF.Mail.Services
             var decoded = System.Net.WebUtility.HtmlDecode(doc.DocumentNode.InnerText);
             return WhitespaceRegex().Replace(decoded, " ").Trim();
         }
-        private static string GetApprovalComment(ClassifyResult result, ClaudeFieldSpec linkField, bool isKnownSender, List<string> missingInfo)
+        private static string GetApprovalComment(ClassifyResult result, ClaudeFieldSpec linkField, bool isKnownSender, List<string> missingInfo, int numHeldMessages = 0, DateTime? firstHeldMessageDT = null)
         // Builds the admin-facing comment for a hold/approval-request email -- echoes what was already
         // extracted (so approving isn't a blind "trust the sender" click) and calls out anything still
         // missing, so one reply can both decide and supply the gap instead of a second round-trip.
@@ -137,17 +139,23 @@ namespace EMF.Mail.Services
         // linkField.Parameter (e.g. "VendName") is the Searchable field's paired display-name field.
         {
             var fields = result.Packages.FirstOrDefault()?.Fields;
-            var name = linkField.Parameter is not null ? GetFieldString(fields, linkField.Parameter) : null;
+            var vendId = GetFieldInt(fields, linkField.FieldName);
+            var name = GetFieldString(fields, linkField.FieldName.Replace("Id", "Name")); //bc 2026/09/15: this is hacky and fragile, needs to be fixed in the future, but for now it works for VendId/VendName
 
-            var lines = new List<string>
-            {
-                name is not null
-                    ? $"This sender is not yet linked to any {linkField.FieldName}. It looks like it may be from \"{name}\" -- reply APPROVE to link it, REJECT to decline, or give the correct name."
-                    : $"This sender is not yet linked to any {linkField.FieldName} and none could be determined from the message. Reply with the correct name to link it to, or REJECT to decline."
-            };
+            var lines = new List<string>();
+
+            if (numHeldMessages > 0 && firstHeldMessageDT is not null)
+                lines.Add($"Reminder: this sender has had {numHeldMessages} message(s) pending approval since {firstHeldMessageDT:d}.");
+
+            lines.Add(
+                vendId is not null && name is not null
+                    ? $"This sender is not yet linked to any {linkField.FieldName}. It looks like it may be from {name}, with {linkField.FieldName} {vendId}. Reply APPROVE to link it, REJECT to decline, or give the correct name."
+                    : name is not null
+                        ? $"This sender is not yet linked to any {linkField.FieldName}. It looks like it may be from \"{name}\" -- reply APPROVE to link it, REJECT to decline, or give the correct name."
+                        : $"This sender is not yet linked to any {linkField.FieldName} and none could be determined from the message. Reply with the correct name to link it to, or REJECT to decline.");
 
             if (result.Packages.Any(p => p.Attachments.Any(a => a.IsPackage)) && !isKnownSender)
-                lines.Add("Attachments have not been opened yet -- I need to confirm this sender is allowed to submit first. They'll be processed once approved.");
+                lines.Add("Due to security concerns, I haven't opened the attachments yet -- I need to confirm this sender is allowed to submit first. They'll be processed once approved.");
 
             lines.AddRange(missingInfo.Select(g => char.ToUpper(g[0]) + g[1..] + "."));
 
@@ -471,8 +479,10 @@ namespace EMF.Mail.Services
             }
             else
             {
+                await mail.MarkNeedsReviewAsync(message.ProvMsgId);
+                await mail.ForwardAsync(message.ProvMsgId, account.AdmAcctEMail, "No packages could be created from this message -- see the log for details.");
                 await FinalizeAsync(new MessageFinalization { MsgNo = msgNo, MsgContext = context, MsgTpCode = result.MsgTpCode, ResTpCode = "NOOP", MsgResult = "No packages created from this message." });
-                Tracker.Track($"MsgNo {msgNo}: no packages created from this message.");
+                Tracker.Track($"MsgNo {msgNo}: no packages created from this message, admin notified.");
             }
         }
         private async Task ProcessInboundMessageAsync(MailAccount account, IMailService mail, List<DocType> docTypes, List<MsgType> msgTypes, Dictionary<int, List<ClaudeFieldSpec>> fieldsByMsgType, string processDesc, Message message)
@@ -506,6 +516,7 @@ namespace EMF.Mail.Services
             var msgNo = msgResult.Value.MsgNo;
             var senderId = msgResult.Value.SenderId;
 
+            Tracker.Track($"MsgNo {msgNo}: classifying message from {message.FromAddr} with {message.Attachments.Count} attachment(s)...");
             var (classifyResult, history, linkField) = await ClassifyMessageAsync(account, docTypes, msgTypes, fieldsByMsgType, processDesc, message, senderId);
 
             if (classifyResult.IsFailure)
@@ -526,28 +537,30 @@ namespace EMF.Mail.Services
             {
                 var isKnownSender = history.Count > 0;
 
-                // A sender's second (or Nth) message naming the same not-yet-approved link value gets held
-                // silently -- only the first pending message for that (sender, value) pair triggers the
-                // forward to admin. linkValue is passed through as-is (possibly null) -- the SQL side
-                // matches a held row with an unresolved value regardless, so a first-contact sender's own
-                // duplicate holds still dedup.
-                var pending = await mailDataSvc.GetHeldMessagesAsync(senderId, linkValue, msgNo);
+                var holds = await mailDataSvc.GetSenderHoldsAsync(senderId, linkValue);
+                var isReminderDue = holds.NumHeldMessages > 0 && holds.FirstHeldMessageDT is not null && holds.FirstHeldMessageDT.Value <= DateTime.UtcNow.AddDays(-ReminderThresholdDays);
 
                 string? fwdMsgId = null;
 
-                // Computed once, reused for both the admin email and the DB write below -- avoids running the
-                // same gap check twice and keeps the two from ever disagreeing with each other.
                 var missingInfo = GetMissingInfo(result, linkField!, isKnownSender);
 
-                if (pending.Count == 0)
-                    fwdMsgId = await mail.SendApprovalRequestAsync(message.ProvMsgId, account.AdmAcctEMail, GetApprovalComment(result, linkField!, isKnownSender, missingInfo));
+                if (holds.NumHeldMessages == 0 || isReminderDue)
+                {
+                    var comment = holds.NumHeldMessages == 0
+                        ? GetApprovalComment(result, linkField!, isKnownSender, missingInfo)
+                        : GetApprovalComment(result, linkField!, isKnownSender, missingInfo, holds.NumHeldMessages, holds.FirstHeldMessageDT);
+
+                    fwdMsgId = await mail.SendApprovalRequestAsync(message.ProvMsgId, account.AdmAcctEMail, comment);
+                }
 
                 var resTpCode = missingInfo.Count > 0 ? "PARTIAL" : "HELD";
                 var msgResultText = missingInfo.Count > 0 ? string.Join("; ", missingInfo) : null;
 
-                var logMsg = pending.Count == 0
+                var logMsg = holds.NumHeldMessages == 0
                     ? $"MsgNo {msgNo} ({message.FromAddr}): sender not linked to identified {linkField!.FieldName}, held pending admin approval."
-                    : $"MsgNo {msgNo} ({message.FromAddr}): already has a pending request for this {linkField!.FieldName}, held silently.";
+                    : isReminderDue
+                        ? $"MsgNo {msgNo} ({message.FromAddr}): {holds.NumHeldMessages} message(s) pending since {holds.FirstHeldMessageDT:d}, reminder sent."
+                        : $"MsgNo {msgNo} ({message.FromAddr}): already has a pending request for this {linkField!.FieldName}, held silently.";
 
                 await FinalizeAsync(new MessageFinalization { MsgNo = msgNo, MsgContext = result, MsgTpCode = result.MsgTpCode, IsHeld = true, FwdMsgId = fwdMsgId, ResTpCode = resTpCode, MsgResult = msgResultText });
                 Tracker.Track(logMsg);
@@ -727,7 +740,7 @@ namespace EMF.Mail.Services
 
             var adminMsgNo = msgResult.Value.MsgNo;
 
-            var held = (await mailDataSvc.GetHeldBridgeAsync(message.BridgeMsgIds)).FirstOrDefault();
+            var held = await mailDataSvc.GetHeldBridgeAsync(message.BridgeMsgIds);
 
             if (held is null)
             {
@@ -739,7 +752,7 @@ namespace EMF.Mail.Services
 
             Tracker.Track($"Admin reply from {message.FromAddr} matched held MsgNo {held.MsgNo}.");
 
-            var cmdResult = await cmdSvc.InterpretApprovalReplyAsync(message.Subject, message.UniqueBody, held.CandVendName);
+            var cmdResult = await cmdSvc.InterpretApprovalReplyAsync(message.Subject, GetPlainText(message.UniqueBody), held.CandVendName);
 
             if (cmdResult.IsFailure)
             {
@@ -762,7 +775,8 @@ namespace EMF.Mail.Services
             // Reuse the candidate VendId directly on a bare confirmation (no correction given) -- only
             // re-resolve via lookup when the admin named something different, or there was no candidate at all.
             int? vendId = held.CandVendId;
-            if (cmdResult.Value.VendorName is not null && !string.Equals(cmdResult.Value.VendorName, held.CandVendName, StringComparison.OrdinalIgnoreCase))
+            var vendName = held.CandVendName;
+            if (vendId is null && cmdResult.Value.VendorName is not null)
             {
                 var matches = await mailDataSvc.GetLookupAsync(cmdResult.Value.VendorName);
                 if (matches.Count != 1)
@@ -773,6 +787,7 @@ namespace EMF.Mail.Services
                     return;
                 }
                 vendId = matches[0].VendId;
+                vendName = matches[0].VendName;
             }
 
             if (vendId is null)
@@ -787,7 +802,7 @@ namespace EMF.Mail.Services
 
             // Fetched before ResolveCommandAsync -- that call clears IsHeld on every match, so the pending
             // set has to be captured first or there'd be nothing left to reprocess/report on.
-            var pending = await mailDataSvc.GetHeldMessagesAsync(held.SenderId, vendId.Value, held.MsgNo);
+            var pending = await mailDataSvc.GetHeldMessagesAsync(held.SenderId, vendId.Value);
 
             if (isApproved)
             {
@@ -821,7 +836,7 @@ namespace EMF.Mail.Services
                     await ReprocessHeldMessageAsync(account, mail, heldMsg, held.SenderId, msgTypes, fieldsByMsgType);
 
             await mail.ReplyAsync(message.ProvMsgId, isApproved
-                ? $"Approved. {pending.Count} message(s) for this vendor were processed."
+                ? $"Your approval was processed. Sender {held.FromAddr} was linked to vendor {vendName}. {pending.Count} held message(s) will be processed. Please check for individual results."
                 : $"Rejected. {pending.Count} message(s) were declined.");
 
             await FinalizeAsync(new MessageFinalization { MsgNo = adminMsgNo, MsgTpCode = "CMD", ResTpCode = "OK" });

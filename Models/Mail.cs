@@ -85,9 +85,17 @@ namespace EMF.Mail.Models
         public int MsgNo { get; set; }
         public int SenderId { get; set; }
         public string MsgId { get; set; } = string.Empty;
+        public string FromAddr { get; set; } = string.Empty;
         public int? CandVendId { get; set; }
         public string? CandVendName { get; set; }
         public string? MsgContext { get; set; }
+    }
+    public class SenderHolds
+    // Result of /msg/mail/senderholds -- aggregate view of a sender's currently open hold batch (if
+    // any), used to decide whether to send a fresh approval request, stay silent, or send a reminder.
+    {
+        public int NumHeldMessages { get; set; }
+        public DateTime? FirstHeldMessageDT { get; set; }
     }
     public class SenderHistory
     // One row per (vendor, doc type) this sender has previously sent for -- a sender linked to more than
@@ -184,7 +192,6 @@ namespace EMF.Mail.Models
     // the actual delta bookmark now driving what GetChangedMessagesAsync fetches next round.
     {
         public int AcctId { get; set; }
-        public DateTime LastPollDT { get; set; }
         public string? LastMsgLink { get; set; }
     }
 }

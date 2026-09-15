@@ -11,11 +11,12 @@ namespace EMF.Mail.Services
         // DB Reads
         public Task<List<MailAccount>> GetMailAccountsAsync() => db.GetTListAsync<MailAccount>("/msg/mail/accounts");
         public Task<List<SenderHistory>> GetSenderHistoryAsync(string hndName, int senderId, int appId) => db.GetTListAsync<SenderHistory>(hndName, senderId, appId);
-        public Task<List<HeldMessage>> GetHeldBridgeAsync(List<string> candidateIds) => db.GetTListAsync<HeldMessage>("/msg/mail/heldbridge", candidateIds); // ordered candidate ids (In-Reply-To + References) -- SQL picks the first match, not a C# loop
-        public Task<List<HeldMessage>> GetHeldMessagesAsync(int senderId, int? vendId, int anchorMsgNo) => db.GetTListAsync<HeldMessage>("/msg/mail/heldbysender", senderId, vendId, anchorMsgNo); // scoped to one hold cycle + one vendor; vendId nullable, SQL matches unresolved rows regardless
+        public Task<RfiBridgeResult> GetRfiBridgeAsync(List<string> candidateIds) => db.GetObjAsync<RfiBridgeResult>("/msg/mail/rfibridge", candidateIds); // same bridging as GetHeldBridgeAsync, matched against SentMsgId instead of FwdMsgId
+        public Task<HeldMessage> GetHeldBridgeAsync(List<string> candidateIds) => db.GetObjAsync<HeldMessage>("/msg/mail/heldbridge", candidateIds); // SQL picks the first match, not a C# loop
+        public Task<SenderHolds> GetSenderHoldsAsync(int senderId, int? linkValue) => db.GetObjAsync<SenderHolds>("/msg/mail/senderholds", senderId, linkValue);
+        public Task<List<HeldMessage>> GetHeldMessagesAsync(int senderId, int? vendId) => db.GetTListAsync<HeldMessage>("/msg/mail/heldbysender", senderId, vendId); // scoped to one hold cycle + one vendor; vendId nullable, SQL matches unresolved rows regardless
         public Task<List<VendorLookup>> GetLookupAsync(string nameFragment) => db.GetTListAsync<VendorLookup>("/ap/lookups/vendid", nameFragment);
         public Task<List<PkgTask>> GetPkgTasksAsync(List<int> pkgNos) => db.GetTListAsync<PkgTask>("/ap/pkg/tasks", pkgNos); // gap-check covers every PkgNo in one call; caller filters IsComplete
-        public Task<List<RfiBridgeResult>> GetRfiBridgeAsync(List<string> candidateIds) => db.GetTListAsync<RfiBridgeResult>("/msg/mail/rfibridge", candidateIds); // same bridging as GetHeldBridgeAsync, matched against SentMsgId instead of FwdMsgId
         public Task<List<Dictionary<string, object>>> GetRecordsAsync(string hndName, params object[] parameters) => db.GetDictListAsync(hndName, parameters);
 
         // DB Writes
