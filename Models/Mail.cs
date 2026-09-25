@@ -11,7 +11,6 @@ namespace EMF.Mail.Models
         public string AcctName { get; set; } = string.Empty;
         public string SecretName { get; set; } = string.Empty;
         public string AdmAcctEMail { get; set; } = string.Empty;
-        public string GetSenderHistHndName { get; set; } = string.Empty;
         public string ProvCode { get; set; } = string.Empty;
         public string TenantId { get; set; } = string.Empty;
         public string ClientId { get; set; } = string.Empty;
@@ -74,47 +73,36 @@ namespace EMF.Mail.Models
         public int MsgNo { get; set; } 
         public int SenderId { get; set; } 
     }
-    public class HeldMessage
-    // Result of /msg/mail/held -- resolves an admin reply back to the message it was forwarded from,
-    // via References[0]/In-Reply-To matched against the stored FwdMsgId. CandVendId/CandVendName are
-    // the candidate Claude proposed at hold time (from MsgContext) -- reused on a bare confirmation
-    // reply instead of re-resolving the vendor name from scratch. MsgContext is the raw persisted json
-    // (populated only by /msg/mail/heldbysender) -- deserializes to a Cheing.Net.Ai.ClassifyResult to
-    // reuse a message's original classification on approval, without a second Claude call.
-    {
-        public int MsgNo { get; set; }
-        public int SenderId { get; set; }
-        public string MsgId { get; set; } = string.Empty;
-        public string FromAddr { get; set; } = string.Empty;
-        public int? CandVendId { get; set; }
-        public string? CandVendName { get; set; }
-        public string? MsgContext { get; set; }
-    }
-    public class SenderHolds
-    // Result of /msg/mail/senderholds -- aggregate view of a sender's currently open hold batch (if
-    // any), used to decide whether to send a fresh approval request, stay silent, or send a reminder.
-    {
-        public int NumHeldMessages { get; set; }
-        public DateTime? FirstHeldMessageDT { get; set; }
-    }
     public class SenderHistory
-    // One row per (vendor, doc type) this sender has previously sent for -- a sender linked to more than
-    // one vendor has multiple rows with different VendId. Distinct by VendId/VendName for the linked-vendor set.
     {
-        public int VendId { get; set; }
-        public string VendName { get; set; } = string.Empty;
+        public int PartyId { get; set; }
+        public string PartyName { get; set; } = string.Empty;
         public int? DocTypeId { get; set; }
         public int NumDocs { get; set; }
     }
-    public class VendorLookup
+    public class ApprRequest
     {
-        public int VendId { get; set; }
-        public string VendName { get; set; } = string.Empty;
+        public int ReqNo { get; set; }
+        public DateTime ReqDT { get; set; }
+        public int SenderId { get; set; }
+        public int PartyTpId { get; set; }
+        public int? PartyId { get; set; }
+        public string? PartyName { get; set; }
+        public string MsgId { get; set; } = string.Empty;
+        public bool? IsApproved { get; set; }
+        public string FromAddr { get; set; } = string.Empty;
+        public int NumItems { get; set; }
+    }
+    public class ApprRequestItem
+    {
+        public int MsgNo { get; set; }
+        public string MsgId { get; set; } = string.Empty;
+        public string? MsgContext { get; set; }
     }
     public class CmdResult
     {
         public string? CmdCode { get; set; }
-        public string? VendorName { get; set; }
+        public string? PartyName { get; set; }
     }
     public record AttachmentContent(string FileName, byte[] Bytes, string MediaType);
     public class PkgTask
@@ -167,19 +155,14 @@ namespace EMF.Mail.Models
         public int MsgNo { get; set; }
         public object? MsgContext { get; set; }
         public string? MsgTpCode { get; set; }
-        public bool? IsHeld { get; set; }
-        public string? FwdMsgId { get; set; }
         public int? IReqNo { get; set; }
         public string ResTpCode { get; set; } = string.Empty;
         public string? MsgResult { get; set; }
     }
     public class MessageResolution
-    // Payload for /filer/msg/resolvecmd -- releases a held sender/vendor batch and logs the admin's
-    // APPROVE/REJECT command against msg.TblCommands in one transactional call.
     {
-        public int SenderId { get; set; }
-        public int VendId { get; set; }
-        public int AnchorMsgNo { get; set; }
+        public int ReqNo { get; set; }
+        public int? PartyId { get; set; }
         public bool IsApproved { get; set; }
         public string CmdCode { get; set; } = string.Empty;
         public int AdminMsgNo { get; set; }

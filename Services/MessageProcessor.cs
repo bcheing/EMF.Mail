@@ -1,5 +1,6 @@
 using Cheing;
 using Cheing.Net.Ai;
+using EMF.DMS.Client;
 using EMF.FilerSvc;
 using EMF.FilerSvc.Models;
 using EMF.Mail.Models;
@@ -14,38 +15,123 @@ using FilerDataService = EMF.FilerSvc.Services.DataService;
 
 namespace EMF.Mail.Services
 {
-    // Single processor for every app -- TriageService and MsgTypeProcessor are both retired. There is
-    // no more per-AppId branching anywhere here: whether an account gets sender-approval gating is read
-    // from MailAccount.GetSenderHistHndName (already a per-account config value), and whether a package
-    // comes from a document or from Fields alone is decided per PackageInstance by whether it has an
-    // IsPackage attachment -- both signals already in the data, no hardcoded AppId check needed.
+    // Code Description ==================================================================================
+    // Author: Bernie Cheing
     // 
-    // mail is supplied by the caller (Program.cs), constructed there per account's ProvCode -- this
-    // method doesn't know or care which provider implementation it's talking to.
-    // ProcessAccountAsync:
-    // Changed messages are fetched FIRST -- the account's msgtypes/doctypes/field lists are only
-    // fetched at all when there's actually mail to process, since an empty poll (the overwhelming
-    // majority of runs) previously paid for that config every single cycle for no reason. The three
-    // fetches that are needed are independent of each other, so they run via Task.WhenAll rather than
-    // sequential awaits.
-    // GetApprovalComment:
-    // Builds the admin-facing comment for a hold/approval-request email -- echoes what was already
-    // extracted (so approving isn't a blind "trust the sender" click) and calls out anything still
-    // missing, so one reply can both decide and supply the gap instead of a second round-trip.
-    // missingInfo is passed in rather than recomputed -- the caller already needed it for MsgResult.
-    // linkField.Parameter (e.g. "VendName") is the Searchable field's paired display-name field.
-    // GetMissingInfo:
-    // The specific gaps in a classification that should be flagged and drive PARTIAL vs HELD -- terse,
-    // no MsgNo/sender/reference numbers (those are already columns on the same row). The link field
-    // (e.g. VendId) only counts as a gap when the sender is known (isKnownSender): for a first-contact
-    // sender, an unresolved link value is the deliberate outcome of not opening the attachment yet, not
-    // something missing.
-    public partial class MessageProcessor(DataService mailDataSvc, FilerDataService filerDataSvc, CommandService cmdSvc, ClaudeClassifier classifier, Filer filer, ConversationService conv)
+    // MessageProcessor -- single processor for every app (TriageService/MsgTypeProcessor retired).
+    // No per-AppId branching: approval gating comes from MsgType.IsApprRequired/PartyTpId (per SUB
+    // entity), and document-vs-body packages are decided per PackageInstance by whether it has an
+    // IsPackage (anchor) attachment. mail is supplied by Program.cs per account ProvCode; this class
+    // never knows which provider it talks to.
+    //
+    // PARTIES
+    // The party a sender submits for (vendor, customer) is generic, configured in ou.LstPartyTypes:
+    // PartyTpName (admin-facing label), PartyTpKeyField/PartyTpNameField (field names in extracted
+    // data, e.g. VendId/VendName), LookupHndName (name -> id resolution; null = no lookup available).
+    // A sender is authorized per (SenderId, PartyTpId, PartyId) in msg.LstSenderPermissions.
+    //
+    // ProcessAccountAsync
+    // Changed messages are fetched first; msgtypes/doctypes/field config is only fetched when there is
+    // mail to process, and those independent fetches run via Task.WhenAll. Routing order per message:
+    // self-sent -> admin reply -> RFI reply bridge -> normal inbound. An RFI reply is checked before
+    // normal classification so it is never re-triaged as a fresh SUB/INQ.
+    //
+    // ProcessInboundMessageAsync / ClassifyMessageAsync
+    // Log, classify, then hold or process. Approval applies only when the SUB entity has
+    // IsApprRequired (matched by MsgTpCode "SUB", not by field-map order). Entities without it (e.g.
+    // LSM Vehicle Shipment) always send every attachment and skip the hold/approve path.
+    // FIRST-CONTACT RULE: an unknown sender's attachments are never opened (spam, oversized or
+    // compromised files) -- classification uses the email text only; files are opened only after an
+    // admin approves the sender. A known sender's attachments are sent on the first pass.
+    // SenderHistory (reinforcement hint) is separate from authorization and not yet wired.
+    //
+    // GetApprovalComment
+    // Admin-facing text for a hold/approval-request email: echoes what was extracted (approval is not
+    // a blind click), names the candidate party using PartyTpName, and lists anything missing so one
+    // reply can both decide and supply the gap. missingInfo is passed in (caller already built it).
+    //
+    // GetMissingInfo
+    // Terse gaps that drive PARTIAL vs HELD; no MsgNo/sender/reference numbers (already on the row).
+    // The party key field only counts as a gap for a known sender -- for first contact, an unresolved
+    // party is the deliberate result of not opening the attachment yet.
+    //
+    // ProcessAdminReplyAsync -- APPROVE/REJECT on an open msg.TblApprRequests row
+    // Every admin message gets its own logged row and a reply; no path leaves the admin unanswered.
+    // 1. Bridge the reply to its request via References/In-Reply-To (/msg/mail/apprrequest). Only an
+    //    open request (IsApproved null) matches.
+    // 2. CommandService interprets the reply (APPROVE/REJECT + optional PartyName). A named party that
+    //    differs from the candidate (or any name when no candidate id exists) is resolved through
+    //    LookupHndName; exactly one match is required, otherwise the admin is asked for the exact name.
+    // 3. APPROVE with no resolvable party -> admin asked to name it; request stays open.
+    // 4. APPROVE -- DEFERRED WRITE: before anything is persisted, every held message is prepared
+    //    (PrepareHeldMessageAsync). If any package's party contradicts the approved one, NOTHING is
+    //    written except the extractions: the admin gets the discrepancy text and the request stays
+    //    open, so their next reply on the same thread bridges back to it.
+    // 5. Only when all held messages agree is the decision written (/filer/msg/resolvecmd: one
+    //    transaction -- request resolved, sender permission inserted if not already present, command
+    //    logged). A failed write is reported to the admin and nothing is processed.
+    // 6. REJECT: written the same way (PartyId kept as the original candidate); every held message is
+    //    finalized REJECTED and the admin gets a confirmation reply (REJECT is an admin command).
+    //
+    // PrepareHeldMessageAsync -- post-approval only
+    // Refetches the original, reads the saved MsgContext, and opens any anchor not yet extracted
+    // (Filer.ClassifyAndExtractAsync -- extract only, nothing saved). New extractions are written back
+    // with /filer/msg/context (MsgContext only; message stays HELD) so a later reply never reopens the
+    // file. Each package's party is then compared to the approved one -- source is the anchor's
+    // ExtractedFields when present, otherwise the body Fields:
+    //   same id      -> match
+    //   no id found  -> body-only package: approved party fills it; anchor document: blocks the
+    //                   approval like a mismatch, and the extraction is discarded (not saved) so the
+    //                   file is re-read once the party has been added to the party list
+    //   different id -> mismatch; the approved party NEVER overrides the document
+    // A mismatch in any package holds the whole message -- a rogue invoice from an approved sender
+    // must never be processed. Failures (refetch, unreadable context) are not finalized here, so they
+    // are retried on the admin's next reply if the approval is not yet written.
+    //
+    // ReprocessHeldMessageAsync -- after the approval is written
+    // Refetch failed -> FAILED. Unreadable MsgContext -> REVIEW + forwarded to admin. An anchor that
+    // could not be extracted (unverified party) -> REVIEW + forwarded, never processed. Otherwise an
+    // empty party field is filled with the approved party (never overwritten) and the saved
+    // classification is processed via ProcessClassifiedMessageAsync (no second Claude call; Filer
+    // saves pre-extracted anchors via SaveExtractedDocumentAsync).
+    //
+    // ProcessClassifiedMessageAsync
+    // Shared by the immediate path and the post-approval path. saveContext is false post-approval
+    // (MsgContext already saved). Attachments are claimed from a pool, not re-matched by FileName, so
+    // several files with the same name each resolve at most once. A null lookup key is passed to the
+    // GetHndName proc as a real NULL, not "".
+    //
+    // CheckAndRequestMissingDocsAsync -- RFI
+    // Runs after a submission's items are saved, only for IsApprRequired entities. One gap-check call
+    // covers all PkgNos; one msg.TblInfoRequests row and one email per PkgNo with gaps (keeps the
+    // rfibridge match unambiguous). PHASE 3: the IsApprRequired gate is a leftover and unrelated to
+    // RFI -- remove it; the AP-only gap check (/ap/pkg/tasks) must become per-MsgType config.
+    //
+    // ProcessInfoReplyAsync -- reply to an open RFI
+    // Attachments are classified only against that package's outstanding gaps and attached with the
+    // real DocTpCode (not "Misc"). Reply text is not interpreted; the conversation log is audit only.
+    // Ask-once: this reply is the only round -- the RFI is closed whether or not all gaps are met, the
+    // admin is notified, and the sender gets no reply. Items are saved in one call for the whole reply.
+    // IReqNo rides in the finalize DTO (no separate link call).
+    //
+    // ProcessSelfSentMessageAsync
+    // The mailbox occasionally emails itself (e.g. a system alert): logged only, never classified,
+    // held, or replied to.
+    //
+    // FinalizeAsync
+    // Single terminal write point for every message. The intended outcome is always logged separately
+    // from whether the write succeeded -- a failed write is never reported as success.
+    //
+    // PENDING: when the total size of a message's attachments exceeds a threshold (not yet set), triage
+    // it as NeedsReview before any file is sent to Claude.
+    // ============================================================================================
+    public partial class MessageProcessor(DataService mailDataSvc, FilerDataService filerDataSvc, CommandService cmdSvc, ClaudeClassifier classifier, Filer filer, ConversationService conv, PkgService dms)
     {
         private const int ReminderThresholdDays = 7;
         [GeneratedRegex(@"\s+")]
         private static partial Regex WhitespaceRegex();
         private static readonly JsonSerializerOptions _jsonOpts = new() { PropertyNameCaseInsensitive = true };
+        private sealed record HeldMessage(ApprRequestItem Item, Message? Orig, ClassifyResult? Result, bool IsVerified, List<string> Mismatches);
 
         #region Public methods. Main entry point from console app.
         public async Task ProcessAccountAsync(MailAccount account, IMailService mail)
@@ -143,24 +229,26 @@ namespace EMF.Mail.Services
             var decoded = System.Net.WebUtility.HtmlDecode(doc.DocumentNode.InnerText);
             return WhitespaceRegex().Replace(decoded, " ").Trim();
         }
-        private static string GetApprovalComment(ClassifyResult result, ClaudeFieldSpec linkField, bool isKnownSender, List<string> missingInfo, int numHeldMessages = 0, DateTime? firstHeldMessageDT = null)
-        
+        private static string GetApprovalComment(ClassifyResult result, PartyType partyType, bool isKnownSender, List<string> missingInfo, int numPendingItems = 0, DateTime? reqDT = null)
         {
             var fields = result.Packages.FirstOrDefault()?.Fields;
-            var vendId = GetFieldInt(fields, linkField.FieldName);
-            var name = GetFieldString(fields, linkField.FieldName.Replace("Id", "Name")); //bc 2026/09/15: this is hacky and fragile, needs to be fixed in the future, but for now it works for VendId/VendName
+            var partyId = GetFieldInt(fields, partyType.PartyTpKeyField);
+            var name = GetFieldString(fields, partyType.PartyTpNameField);
 
             var lines = new List<string>();
 
-            if (numHeldMessages > 0 && firstHeldMessageDT is not null)
-                lines.Add($"Reminder: this sender has had {numHeldMessages} message(s) pending approval since {firstHeldMessageDT:d}.");
+            if (numPendingItems > 0 && reqDT is not null)
+                lines.Add($"Reminder: this sender has had {numPendingItems} message(s) pending approval since {reqDT:d}.");
 
-            lines.Add(
-                vendId is not null && name is not null
-                    ? $"This sender is not yet linked to any {linkField.FieldName}. It looks like it may be from {name}, with {linkField.FieldName} {vendId}. Reply APPROVE to link it, REJECT to decline, or give the correct name."
-                    : name is not null
-                        ? $"This sender is not yet linked to any {linkField.FieldName}. It looks like it may be from \"{name}\" -- reply APPROVE to link it, REJECT to decline, or give the correct name."
-                        : $"This sender is not yet linked to any {linkField.FieldName} and none could be determined from the message. Reply with the correct name to link it to, or REJECT to decline.");
+            var label = partyType.PartyTpName.ToLower();
+            string ask;
+            if (partyId is not null && name is not null)
+                ask = $"This sender is not yet linked to any {label}. It looks like it may be from {name} ({partyType.PartyTpKeyField} {partyId}). Reply APPROVE to link it, REJECT to decline, or give the correct name.";
+            else if (name is not null)
+                ask = $"This sender is not yet linked to any {label}. It looks like it may be from \"{name}\" -- reply APPROVE to link it, REJECT to decline, or give the correct name.";
+            else
+                ask = $"This sender is not yet linked to any {label} and none could be determined from the message. Reply with the correct {label} name to link it to, or REJECT to decline.";
+            lines.Add(ask);
 
             if (result.Packages.Any(p => p.Attachments.Any(a => a.IsPackage)) && !isKnownSender)
                 lines.Add("Due to security concerns, I haven't opened the attachments yet -- I need to confirm this sender is allowed to submit first. They'll be processed once approved.");
@@ -169,7 +257,7 @@ namespace EMF.Mail.Services
 
             return string.Join(" ", lines);
         }
-        private static List<string> GetMissingInfo(ClassifyResult result, ClaudeFieldSpec linkField, bool isKnownSender)
+        private static List<string> GetMissingInfo(ClassifyResult result, PartyType partyType, bool isKnownSender)
         {
             var gaps = new List<string>();
 
@@ -178,31 +266,31 @@ namespace EMF.Mail.Services
             else if (result.Packages.Count == 0)
                 gaps.Add("no packages could be identified for processing");
 
-            var linkValue = GetFieldValue(result.Packages.FirstOrDefault()?.Fields, linkField.FieldName);
-            if (isKnownSender && linkValue is null)
-                gaps.Add($"{linkField.FieldName} could not be confirmed even after reviewing the attachment");
+            var partyValue = GetFieldValue(result.Packages.FirstOrDefault()?.Fields, partyType.PartyTpKeyField);
+            if (isKnownSender && partyValue is null)
+                gaps.Add($"{partyType.PartyTpName.ToLower()} could not be confirmed even after reviewing the attachment");
 
             return gaps;
+        }    
+        private static void FillPartyFields(Dictionary<string, object> fields, PartyType partyType, int partyId, string? partyName)
+        {
+            if (GetFieldInt(fields, partyType.PartyTpKeyField) is not null) return;
+            fields[partyType.PartyTpKeyField] = partyId;
+            if (partyName is not null) fields[partyType.PartyTpNameField] = partyName;
         }
         #endregion
 
         #region Private processing methods
-        private async Task<(Result<ClassifyResult> Result, List<SenderHistory> History, ClaudeFieldSpec? LinkField)> ClassifyMessageAsync(MailAccount account, List<DocType> docTypes, List<MsgType> msgTypes, Dictionary<int, List<ClaudeFieldSpec>> fieldsByMsgType, string processDesc, Message message, int senderId)
-        // Builds the classify content + runs it. History/isKnownSender/linkField only matter for accounts
-        // with a sender-approval gate configured (GetSenderHistHndName non-empty, e.g. AP's vendor link) --
-        // an account without one (e.g. LSM) always sends every attachment and skips the hold/approve path
-        // entirely below. linkField is whichever field on the SUB entity is Searchable (VendId today) --
-        // there is at most one across the current data, so "first msgtype with a fields-having entity" is
-        // enough; an app that ever needs two distinct SUB entities would need this reconsidered.
+        private async Task<(Result<ClassifyResult> Result, List<int?> PartyIds, PartyType? PartyType)> ClassifyMessageAsync(List<DocType> docTypes, List<MsgType> msgTypes, Dictionary<int, List<ClaudeFieldSpec>> fieldsByMsgType, string processDesc, Message message, int senderId)
         {
-            var hasLinkGate = !string.IsNullOrEmpty(account.GetSenderHistHndName);
-            var history = hasLinkGate ? await mailDataSvc.GetSenderHistoryAsync(account.GetSenderHistHndName, senderId, account.AppId) : [];
-            var isKnownSender = history.Count > 0;
+            var subType = msgTypes.FirstOrDefault(t => t.MsgTpCode == "SUB");
+            var hasLinkGate = subType?.IsApprRequired ?? false;
 
-            var subType = msgTypes.FirstOrDefault(t => fieldsByMsgType.ContainsKey(t.MsgTpId));
-            var linkField = subType is not null && fieldsByMsgType.TryGetValue(subType.MsgTpId, out var subFields)
-                ? subFields.FirstOrDefault(f => f.FieldMode == "Searchable")
-                : null;
+            var partyType = hasLinkGate ? (await dms.GetPartyTypesAsync()).FirstOrDefault(p => p.PartyTpId == subType!.PartyTpId) : null;
+
+            List<SenderHistory> history = [];
+            var partyIds = partyType is not null ? await mailDataSvc.GetSenderPartyIdsAsync(senderId, partyType.PartyTpId) : [];
+            var isKnownSender = partyIds.Count > 0;
 
             var content = new List<ClaudeContentPart>
             {
@@ -210,16 +298,13 @@ namespace EMF.Mail.Services
                 new("text/plain", Text: $"Attachments: {(message.Attachments.Count > 0 ? string.Join(", ", message.Attachments.Select(a => a.FileName)) : "none")}")
             };
 
-            if (linkField is not null)
+            if (partyType is not null)
             {
-                var linked = history.Select(h => (h.VendId, h.VendName)).Distinct().ToList();
-                var linkedText = linked.Count > 0 ? string.Join("; ", linked.Select(v => $"{linkField.FieldName} {v.VendId} ({v.VendName})")) : "This sender is not linked to anything yet.";
-                content.Add(new ClaudeContentPart("text/plain", Text: $"{linkField.FieldName} already linked to this sender: {linkedText}"));
+                var linked = history.Select(h => (h.PartyId, h.PartyName)).Distinct().ToList();
+                var linkedText = linked.Count > 0 ? string.Join("; ", linked.Select(v => $"{partyType.PartyTpKeyField} {v.PartyId} ({v.PartyName})")) : "This sender is not linked to anything yet.";
+                content.Add(new ClaudeContentPart("text/plain", Text: $"{partyType.PartyTpKeyField} already linked to this sender: {linkedText}"));
             }
 
-            // Attachment images are only included once the sender has prior history -- a first-contact
-            // sender hasn't been approved for anything, so nothing gets opened on their behalf until an
-            // admin confirms it. Accounts with no link gate at all (isKnownSender never applies) always include.
             var includeExtraction = !hasLinkGate || isKnownSender;
             if (includeExtraction)
                 content.AddRange(message.Attachments.Select(a => new ClaudeContentPart(a.MediaType, Data: a.Bytes)));
@@ -228,15 +313,9 @@ namespace EMF.Mail.Services
             var docTypeOptions = docTypes.Select(d => new ClaudeClassification { Id = d.DocTpId, Code = d.DocTpCode, Name = d.DocTpName, Desc = d.DocTpDesc }).ToList();
 
             var result = await classifier.ClassifyEmailAsync(content, processDesc, msgTypeOptions, docTypeOptions, fieldsByMsgType, includeExtraction);
-            return (result, history, linkField);
+            return (result, partyIds, partyType);
         }
         private async Task CheckAndRequestMissingDocsAsync(IMailService mail, Message message, string fromAddr, int msgNo, List<int> pkgNos)
-        // Runs right after a submission's items are saved -- one gap-check call covers every PkgNo the
-        // submission created (ap.sprTblGetTasks accepts a list). One msg.TblInfoRequests row and one email
-        // per PkgNo with outstanding gaps, not one combined email for the whole submission -- keeps the
-        // bridge match unambiguous (rfibridge's SentMsgId lookup resolves to exactly one row) without needing
-        // to work out which package a reply is about when a submission created more than one. AP-specific
-        // (ap.LstInvcTypeDocTypes) -- only called for accounts with a sender-approval gate configured.
         {
             var tasks = await mailDataSvc.GetPkgTasksAsync(pkgNos);
 
@@ -280,9 +359,6 @@ namespace EMF.Mail.Services
             }
         }
         private async Task ProcessSelfSentMessageAsync(MailAccount account, Message message)
-        // The polled mailbox occasionally emails itself -- e.g. an underlying system error/alert configured
-        // against the same address EMF.Mail is watching for inbound submissions. Logged for visibility but
-        // never classified, held, or replied to -- there's no sender to link and nothing to approve.
         {
             var msgId = message.InternetMessageId ?? message.ProvMsgId;
 
@@ -308,16 +384,6 @@ namespace EMF.Mail.Services
             Tracker.Track($"MsgNo {msgResult.Value.MsgNo}: message from the account's own address, logged and skipped.");
         }
         private async Task ProcessClassifiedMessageAsync(MailAccount account, IMailService mail, Message message, int msgNo, int senderId, List<MsgType> msgTypes, Dictionary<int, List<ClaudeFieldSpec>> fieldsByMsgType, ClassifyResult result, bool saveContext)
-        // Acts on an already-classified message -- shared by the immediate path (classification just ran as
-        // part of the hold decision, link field matched an already-approved value) and the post-approval
-        // fan-out path (classification is reused from the original hold's saved MsgContext, not re-run).
-        // saveContext is false on the fan-out path -- MsgContext was already written when the message was
-        // first held, so the finalize call there only needs to touch MsgTpId/ResTpId/IsProcessed, not resave it.
-        // Consumed from this pool (not re-queried against message.Attachments directly) so two attachments
-        // sharing the same FileName -- e.g. three PDFs all named "invoice.pdf" -- can't both resolve to the
-        // same first match; each is claimed at most once.
-        // Passed through as-is (possibly null) rather than coerced to "" -- an unspecified key should
-        // reach the GetHndName proc as a real NULL, not a literal empty-string filter value.
         {
             var context = saveContext ? result : null;
 
@@ -351,7 +417,7 @@ namespace EMF.Mail.Services
                 var fields = fieldsByMsgType.GetValueOrDefault(msgType.MsgTpId) ?? [];
                 var keyFields = fields.Where(f => f.IsKey && f.FieldMode != "Searchable").ToList();
                 var pkgFields = result.Packages.FirstOrDefault()?.Fields;
-                
+
                 var keyValues = keyFields.Select(f => (object)(GetFieldString(pkgFields, f.FieldName)!)).ToArray();
 
                 var matches = await mailDataSvc.GetRecordsAsync(msgType.GetHndName, [senderId, .. keyValues]);
@@ -397,7 +463,7 @@ namespace EMF.Mail.Services
 
                 await FinalizeAsync(new MessageFinalization { MsgNo = msgNo, MsgContext = context, MsgTpCode = result.MsgTpCode, ResTpCode = "OK" });
 
-                if (!string.IsNullOrEmpty(account.GetSenderHistHndName))
+                if (msgType.IsApprRequired)
                     await CheckAndRequestMissingDocsAsync(mail, message, message.FromAddr, msgNo, pkgNosCreated);
             }
             else
@@ -409,10 +475,6 @@ namespace EMF.Mail.Services
             }
         }
         private async Task ProcessInboundMessageAsync(MailAccount account, IMailService mail, List<DocType> docTypes, List<MsgType> msgTypes, Dictionary<int, List<ClaudeFieldSpec>> fieldsByMsgType, string processDesc, Message message)
-        // Handles one inbound (non-admin) message: log it, classify it, then either hold for approval
-        // or process it immediately depending on the link field (e.g. VendId) -- or, for an account with
-        // no sender-approval gate configured at all, straight to processing every time.
-
         {
             var msgId = message.InternetMessageId ?? message.ProvMsgId;
 
@@ -440,7 +502,7 @@ namespace EMF.Mail.Services
             var senderId = msgResult.Value.SenderId;
 
             Tracker.Track($"MsgNo {msgNo}: classifying message from {message.FromAddr} with {message.Attachments.Count} attachment(s)...");
-            var (classifyResult, history, linkField) = await ClassifyMessageAsync(account, docTypes, msgTypes, fieldsByMsgType, processDesc, message, senderId);
+            var (classifyResult, partyIds, partyType) = await ClassifyMessageAsync(docTypes, msgTypes, fieldsByMsgType, processDesc, message, senderId);
 
             if (classifyResult.IsFailure)
             {
@@ -453,39 +515,54 @@ namespace EMF.Mail.Services
 
             var result = classifyResult.Value;
             var pkgFields = result.Packages.FirstOrDefault()?.Fields;
-            var linkValue = linkField is not null ? GetFieldInt(pkgFields, linkField.FieldName) : null;
-            var isLinked = linkField is null || (linkValue is not null && history.Any(h => h.VendId == linkValue));
+            var candidatePartyId = partyType is not null ? GetFieldInt(pkgFields, partyType.PartyTpKeyField) : null;
+            var classifiedType = msgTypes.FirstOrDefault(t => t.MsgTpCode == result.MsgTpCode);
+            var isGated = partyType is not null && (classifiedType?.IsApprRequired ?? false);
+            var isLinked = !isGated || partyIds.Contains(candidatePartyId) || partyIds.Contains(null);
 
             if (!isLinked)
             {
-                var isKnownSender = history.Count > 0;
+                var isKnownSender = partyIds.Count > 0;
 
-                var holds = await mailDataSvc.GetSenderHoldsAsync(senderId, linkValue);
-                var isReminderDue = holds.NumHeldMessages > 0 && holds.FirstHeldMessageDT is not null && holds.FirstHeldMessageDT.Value <= DateTime.UtcNow.AddDays(-ReminderThresholdDays);
+                var openReq = await mailDataSvc.GetOpenRequestAsync(senderId, partyType!.PartyTpId);
+                var isReminderDue = openReq is not null && openReq.ReqDT <= DateTime.UtcNow.AddDays(-ReminderThresholdDays);
 
-                string? fwdMsgId = null;
+                var missingInfo = GetMissingInfo(result, partyType, isKnownSender);
 
-                var missingInfo = GetMissingInfo(result, linkField!, isKnownSender);
+                string? noticeMsgId = message.InternetMessageId;
 
-                if (holds.NumHeldMessages == 0 || isReminderDue)
+                if (openReq is null)
                 {
-                    var comment = holds.NumHeldMessages == 0
-                        ? GetApprovalComment(result, linkField!, isKnownSender, missingInfo)
-                        : GetApprovalComment(result, linkField!, isKnownSender, missingInfo, holds.NumHeldMessages, holds.FirstHeldMessageDT);
+                    var comment = GetApprovalComment(result, partyType, isKnownSender, missingInfo);
+                    noticeMsgId = await mail.SendApprovalRequestAsync(message.ProvMsgId, account.AdmAcctEMail, comment);
+                }
+                else if (isReminderDue)
+                {
+                    var comment = GetApprovalComment(result, partyType, isKnownSender, missingInfo, openReq.NumItems, openReq.ReqDT);
+                    var orig = await mail.GetMessageByIdAsync(openReq.MsgId);
+                    if (orig is not null)
+                        await mail.ReplyAsync(orig.ProvMsgId, comment);
+                }
 
-                    fwdMsgId = await mail.SendApprovalRequestAsync(message.ProvMsgId, account.AdmAcctEMail, comment);
+                var candidatePartyName = partyType is not null ? GetFieldString(pkgFields, partyType.PartyTpNameField) : null;
+                var saveResult = await mailDataSvc.SaveApprRequestAsync(new { SenderId = senderId, PartyTpId = partyType!.PartyTpId, PartyId = candidatePartyId, PartyName = candidatePartyName, MsgNo = msgNo, MsgId = noticeMsgId });
+                if (saveResult.IsFailure)
+                {
+                    await FinalizeAsync(new MessageFinalization { MsgNo = msgNo, ResTpCode = "REVIEW", MsgResult = $"Failed to save approval request: {saveResult.Message}" });
+                    Tracker.Track($"MsgNo {msgNo}: failed to save approval request ({saveResult.Message}).");
+                    return;
                 }
 
                 var resTpCode = missingInfo.Count > 0 ? "PARTIAL" : "HELD";
                 var msgResultText = missingInfo.Count > 0 ? string.Join("; ", missingInfo) : null;
 
-                var logMsg = holds.NumHeldMessages == 0
-                    ? $"MsgNo {msgNo} ({message.FromAddr}): sender not linked to identified {linkField!.FieldName}, held pending admin approval."
+                var logMsg = openReq is null
+                    ? $"MsgNo {msgNo} ({message.FromAddr}): sender not linked to identified {partyType!.PartyTpKeyField}, held pending admin approval."
                     : isReminderDue
-                        ? $"MsgNo {msgNo} ({message.FromAddr}): {holds.NumHeldMessages} message(s) pending since {holds.FirstHeldMessageDT:d}, reminder sent."
-                        : $"MsgNo {msgNo} ({message.FromAddr}): already has a pending request for this {linkField!.FieldName}, held silently.";
+                        ? $"MsgNo {msgNo} ({message.FromAddr}): {openReq.NumItems} message(s) pending since {openReq.ReqDT:d}, reminder sent."
+                        : $"MsgNo {msgNo} ({message.FromAddr}): already has a pending request for this {partyType!.PartyTpKeyField}, held silently.";
 
-                await FinalizeAsync(new MessageFinalization { MsgNo = msgNo, MsgContext = result, MsgTpCode = result.MsgTpCode, IsHeld = true, FwdMsgId = fwdMsgId, ResTpCode = resTpCode, MsgResult = msgResultText });
+                await FinalizeAsync(new MessageFinalization { MsgNo = msgNo, MsgContext = result, MsgTpCode = result.MsgTpCode, ResTpCode = resTpCode, MsgResult = msgResultText });
                 Tracker.Track(logMsg);
                 return;
             }
@@ -493,19 +570,6 @@ namespace EMF.Mail.Services
             await ProcessClassifiedMessageAsync(account, mail, message, msgNo, senderId, msgTypes, fieldsByMsgType, result, saveContext: true);
         }
         private async Task ProcessInfoRequestReplyAsync(MailAccount account, IMailService mail, Message message, RfiBridgeResult bridge, List<DocType> docTypes, string processDesc)
-        // Handles one reply that bridged back to an open msg.TblInfoRequests row (see the rfibridge check
-        // in ProcessAccountAsync). Attachments are classified only against that package's still-outstanding
-        // gaps (ap.sprTblGetTasks), not the full doc-type list -- a match attaches with the real DocTpCode
-        // (Filer.AttachDocumentAsync's docTypeId overload) instead of falling back to "Misc". No Claude call
-        // interprets the reply text itself -- attachments-only scope doesn't need it (see ProjectContext);
-        // the conversation log here is audit trail, not something replayed back into a live Claude call.
-        //
-        // Ask-once design: this reply is the ONLY round -- no resend/re-ask to the vendor regardless of
-        // outcome (see ProjectContext). Whether every gap is satisfied or some remain, the InfoRequest is
-        // closed here and the admin is notified; no further automated contact with the sender on this
-        // request. Vendor gets no reply at all in either branch for now -- deliberate, a later admin-command
-        // pass may add one back. Unaffected by this redesign -- doesn't touch ClassifyResult/Packages at all.
-
         {
             var msgId = message.InternetMessageId ?? message.ProvMsgId;
 
@@ -597,18 +661,10 @@ namespace EMF.Mail.Services
                 Tracker.Track($"IReqNo {bridge.IReqNo}: {remaining.Count} item(s) still outstanding after reply, closed (no re-ask), admin notified.");
             }
         }
-        private async Task ReprocessHeldMessageAsync(MailAccount account, IMailService mail, HeldMessage heldMsg, int senderId, List<MsgType> msgTypes, Dictionary<int, List<ClaudeFieldSpec>> fieldsByMsgType)
-        // Reprocesses one previously-held message after its link value is approved -- reuses the
-        // classification saved in MsgContext at hold time instead of re-running Claude.
-
+        private async Task<HeldMessage> PrepareHeldMessageAsync(MailAccount account, IMailService mail, ApprRequestItem heldMsg, PartyType partyType, int partyId, string? partyName)
         {
             var orig = await mail.GetMessageByIdAsync(heldMsg.MsgId);
-            if (orig is null)
-            {
-                await FinalizeAsync(new MessageFinalization { MsgNo = heldMsg.MsgNo, ResTpCode = "FAILED", MsgResult = "Approved but original message could not be refetched from Inbox." });
-                Tracker.Track($"MsgNo {heldMsg.MsgNo}: approved but original message could not be refetched from Inbox.");
-                return;
-            }
+            if (orig is null) return new HeldMessage(heldMsg, null, null, false, []);
 
             ClassifyResult? result = null;
             try
@@ -620,24 +676,102 @@ namespace EMF.Mail.Services
             {
                 result = null;
             }
+            if (result is null) return new HeldMessage(heldMsg, orig, null, false, []);
 
-            if (result is null)
+            var isExtracted = false;
+            foreach (var anchor in result.Packages.SelectMany(p => p.Attachments).Where(a => a.IsPackage && a.ExtractedFields is null))
             {
-                await mail.MarkNeedsReviewAsync(orig.ProvMsgId);
-                await mail.ForwardAsync(orig.ProvMsgId, account.AdmAcctEMail, "This message's saved classification could not be read and needs manual review.");
-                await FinalizeAsync(new MessageFinalization { MsgNo = heldMsg.MsgNo, ResTpCode = "REVIEW", MsgResult = "Saved MsgContext missing or unreadable on reprocess." });
-                Tracker.Track($"MsgNo {heldMsg.MsgNo}: saved MsgContext missing or unreadable on reprocess.");
+                var file = orig.Attachments.FirstOrDefault(a => a.FileName == anchor.FileName);
+                if (file is null) continue;
+
+                var extracted = await filer.ClassifyAndExtractAsync(account.AppId, file.Bytes, file.MediaType, file.FileName);
+                if (extracted.IsFailure)
+                {
+                    Tracker.Track($"MsgNo {heldMsg.MsgNo}: extraction of {file.FileName} failed ({extracted.Message}).");
+                    continue;
+                }
+
+                anchor.DocTpId = extracted.Value.DocType.DocTpId;
+                anchor.ExtractedFields = extracted.Value.Fields;
+                isExtracted = true;
+            }
+
+            if (isExtracted)
+                await mailDataSvc.SaveMessageContextAsync(heldMsg.MsgNo, result);
+
+            var isVerified = !result.Packages.SelectMany(p => p.Attachments).Any(a => a.IsPackage && a.ExtractedFields is null);
+
+            var label = partyType.PartyTpName.ToLower();
+            var mismatches = new List<string>();
+            foreach (var pkg in result.Packages)
+            {
+                var anchor = pkg.Attachments.FirstOrDefault(a => a.IsPackage && a.ExtractedFields is not null);
+                var source = anchor?.ExtractedFields ?? pkg.Fields;
+
+                var foundId = GetFieldInt(source, partyType.PartyTpKeyField);
+                if (foundId == partyId) continue;
+
+                var foundName = GetFieldString(source, partyType.PartyTpNameField);
+
+                if (foundId is null)
+                {
+                    if (anchor is null) continue;
+                    mismatches.Add(foundName is null
+                        ? $"I could not identify a {label} in {anchor.FileName}."
+                        : $"I could not identify a {label} in {anchor.FileName}. It names \"{foundName}\", which is not on file.");
+                    anchor.DocTpId = null;
+                    anchor.ExtractedFields = null;
+                    continue;
+                }
+
+                var docName = anchor is not null ? anchor.FileName : "the email text";
+                mismatches.Add($"The {label} you provided {partyName ?? "(no name)"} with {partyType.PartyTpKeyField} {partyId} does not match what I found in {docName}. I found {foundName ?? "(no name)"} with {partyType.PartyTpKeyField} {foundId}.");
+            }
+
+            if (isExtracted)
+                await mailDataSvc.SaveMessageContextAsync(heldMsg.MsgNo, result);
+
+            return new HeldMessage(heldMsg, orig, result, isVerified, mismatches);
+        }
+        private async Task ReprocessHeldMessageAsync(MailAccount account, IMailService mail, HeldMessage held, int senderId, PartyType partyType, int partyId, string? partyName, List<MsgType> msgTypes, Dictionary<int, List<ClaudeFieldSpec>> fieldsByMsgType)
+        {
+            var msgNo = held.Item.MsgNo;
+
+            if (held.Orig is null)
+            {
+                await FinalizeAsync(new MessageFinalization { MsgNo = msgNo, ResTpCode = "FAILED", MsgResult = "Approved but original message could not be refetched from Inbox." });
+                Tracker.Track($"MsgNo {msgNo}: approved but original message could not be refetched from Inbox.");
                 return;
             }
 
-            await ProcessClassifiedMessageAsync(account, mail, orig, heldMsg.MsgNo, senderId, msgTypes, fieldsByMsgType, result, saveContext: false);
+            if (held.Result is null)
+            {
+                await mail.MarkNeedsReviewAsync(held.Orig.ProvMsgId);
+                await mail.ForwardAsync(held.Orig.ProvMsgId, account.AdmAcctEMail, "This message's saved classification could not be read and needs manual review.");
+                await FinalizeAsync(new MessageFinalization { MsgNo = msgNo, ResTpCode = "REVIEW", MsgResult = "Saved MsgContext missing or unreadable on reprocess." });
+                Tracker.Track($"MsgNo {msgNo}: saved MsgContext missing or unreadable on reprocess.");
+                return;
+            }
+
+            if (!held.IsVerified)
+            {
+                await mail.MarkNeedsReviewAsync(held.Orig.ProvMsgId);
+                await mail.ForwardAsync(held.Orig.ProvMsgId, account.AdmAcctEMail, $"An attachment on this message could not be read to confirm the {partyType.PartyTpName.ToLower()}, so it was not processed and needs manual review.");
+                await FinalizeAsync(new MessageFinalization { MsgNo = msgNo, ResTpCode = "REVIEW", MsgResult = "Anchor could not be extracted to verify party." });
+                Tracker.Track($"MsgNo {msgNo}: anchor could not be extracted to verify party, sent to review.");
+                return;
+            }
+
+            foreach (var pkg in held.Result.Packages)
+            {
+                FillPartyFields(pkg.Fields, partyType, partyId, partyName);
+                foreach (var anchor in pkg.Attachments.Where(a => a.IsPackage && a.ExtractedFields is not null))
+                    FillPartyFields(anchor.ExtractedFields!, partyType, partyId, partyName);
+            }
+
+            await ProcessClassifiedMessageAsync(account, mail, held.Orig, msgNo, senderId, msgTypes, fieldsByMsgType, held.Result, saveContext: false);
         }
         private async Task ProcessAdminReplyAsync(MailAccount account, IMailService mail, Message message, List<MsgType> msgTypes, Dictionary<int, List<ClaudeFieldSpec>> fieldsByMsgType)
-        // Handles one admin reply: match it to a held message, interpret APPROVE/REJECT, act on it, and
-        // fan out to every other message the sender has pending. Every admin message gets its own logged
-        // row and a reply -- no path here leaves the admin without a response. Unaffected by this redesign
-        // apart from threading msgTypes/fieldsByMsgType through to the reprocess call below.
-
         {
             var msgId = message.InternetMessageId ?? message.ProvMsgId;
 
@@ -663,113 +797,130 @@ namespace EMF.Mail.Services
 
             var adminMsgNo = msgResult.Value.MsgNo;
 
-            var held = await mailDataSvc.GetHeldBridgeAsync(message.BridgeMsgIds);
+            var req = await mailDataSvc.GetApprRequestAsync(message.BridgeMsgIds);
 
-            if (held is null)
+            if (req is null)
             {
-                await mail.ReplyAsync(message.ProvMsgId, "This reply doesn't correspond to a message currently on hold -- there's nothing to act on.");
-                await FinalizeAsync(new MessageFinalization { MsgNo = adminMsgNo, MsgTpCode = "CMD", ResTpCode = "REVIEW", MsgResult = "No matching hold found." });
-                Tracker.Track($"Admin message from {message.FromAddr}: no matching hold.");
+                await mail.ReplyAsync(message.ProvMsgId, "This reply doesn't correspond to a request currently pending approval -- there's nothing to act on.");
+                await FinalizeAsync(new MessageFinalization { MsgNo = adminMsgNo, MsgTpCode = "CMD", ResTpCode = "REVIEW", MsgResult = "No matching approval request found." });
+                Tracker.Track($"Admin message from {message.FromAddr}: no matching approval request.");
                 return;
             }
 
-            Tracker.Track($"Admin reply from {message.FromAddr} matched held MsgNo {held.MsgNo}.");
+            Tracker.Track($"Admin reply from {message.FromAddr} matched ReqNo {req.ReqNo}.");
 
-            var cmdResult = await cmdSvc.InterpretApprovalReplyAsync(message.Subject, GetPlainText(message.UniqueBody), held.CandVendName);
+            var partyType = (await dms.GetPartyTypesAsync()).FirstOrDefault(p => p.PartyTpId == req.PartyTpId);
+
+            if (partyType is null)
+            {
+                await mail.ReplyAsync(message.ProvMsgId, "Something went wrong processing that reply. Please contact support.");
+                await FinalizeAsync(new MessageFinalization { MsgNo = adminMsgNo, MsgTpCode = "CMD", ResTpCode = "FAILED", MsgResult = $"PartyTpId {req.PartyTpId} not configured." });
+                Tracker.Track($"ReqNo {req.ReqNo}: PartyTpId {req.PartyTpId} not configured.");
+                return;
+            }
+
+            var label = partyType.PartyTpName.ToLower();
+
+            var cmdResult = await cmdSvc.InterpretApprovalReplyAsync(message.Subject, GetPlainText(message.UniqueBody), partyType.PartyTpName, req.PartyName);
 
             if (cmdResult.IsFailure)
             {
                 await mail.ReplyAsync(message.ProvMsgId, "Something went wrong interpreting that reply. Please try again.");
                 await FinalizeAsync(new MessageFinalization { MsgNo = adminMsgNo, MsgTpCode = "CMD", ResTpCode = "FAILED", MsgResult = $"Claude command interpretation failed: {cmdResult.Message}" });
-                Tracker.Track($"MsgNo {held.MsgNo}: Claude command interpretation failed ({cmdResult.Message}).");
+                Tracker.Track($"ReqNo {req.ReqNo}: Claude command interpretation failed ({cmdResult.Message}).");
                 return;
             }
 
-            // Explicit both ways -- anything that isn't exactly APPROVE or REJECT (including null) is
-            // treated as "didn't understand," never silently folded into a REJECT.
             if (cmdResult.Value.CmdCode != "APPROVE" && cmdResult.Value.CmdCode != "REJECT")
             {
-                await mail.ReplyAsync(message.ProvMsgId, "Sorry, I couldn't understand that reply. Please reply APPROVE, REJECT, or the correct vendor name.");
+                await mail.ReplyAsync(message.ProvMsgId, "Sorry, I couldn't understand that reply. Please reply APPROVE, REJECT, or the correct name.");
                 await FinalizeAsync(new MessageFinalization { MsgNo = adminMsgNo, MsgTpCode = "CMD", ResTpCode = "REVIEW", MsgResult = "Admin reply did not resolve to APPROVE/REJECT." });
-                Tracker.Track($"MsgNo {held.MsgNo}: admin reply did not resolve to APPROVE/REJECT, left on hold.");
-                return;
-            }
-
-            // Reuse the candidate VendId directly on a bare confirmation (no correction given) -- only
-            // re-resolve via lookup when the admin named something different, or there was no candidate at all.
-            int? vendId = held.CandVendId;
-            var vendName = held.CandVendName;
-            if (vendId is null && cmdResult.Value.VendorName is not null)
-            {
-                var matches = await mailDataSvc.GetLookupAsync(cmdResult.Value.VendorName);
-                if (matches.Count != 1)
-                {
-                    await mail.ReplyAsync(message.ProvMsgId, $"Vendor \"{cmdResult.Value.VendorName}\" not found. Please reply with the exact vendor name.");
-                    await FinalizeAsync(new MessageFinalization { MsgNo = adminMsgNo, MsgTpCode = "CMD", ResTpCode = "REVIEW", MsgResult = $"Vendor \"{cmdResult.Value.VendorName}\" not found (or ambiguous)." });
-                    Tracker.Track($"MsgNo {held.MsgNo}: vendor \"{cmdResult.Value.VendorName}\" not found (or ambiguous), left on hold.");
-                    return;
-                }
-                vendId = matches[0].VendId;
-                vendName = matches[0].VendName;
-            }
-
-            if (vendId is null)
-            {
-                await mail.ReplyAsync(message.ProvMsgId, "Please reply with the vendor name to link this sender to.");
-                await FinalizeAsync(new MessageFinalization { MsgNo = adminMsgNo, MsgTpCode = "CMD", ResTpCode = "REVIEW", MsgResult = "No vendor could be resolved." });
-                Tracker.Track($"MsgNo {held.MsgNo}: no vendor could be resolved, left on hold.");
+                Tracker.Track($"ReqNo {req.ReqNo}: admin reply did not resolve to APPROVE/REJECT, left pending.");
                 return;
             }
 
             var isApproved = cmdResult.Value.CmdCode == "APPROVE";
+            var namedParty = cmdResult.Value.PartyName;
 
-            // Fetched before ResolveCommandAsync -- that call clears IsHeld on every match, so the pending
-            // set has to be captured first or there'd be nothing left to reprocess/report on.
-            var pending = await mailDataSvc.GetHeldMessagesAsync(held.SenderId, vendId.Value);
+            int? partyId = req.PartyId;
+            var partyName = req.PartyName;
 
-            if (isApproved)
+            if (isApproved && namedParty is not null && (partyId is null || !string.Equals(namedParty, req.PartyName, StringComparison.OrdinalIgnoreCase)))
             {
-                var linkResult = await mailDataSvc.SaveSenderLinkAsync(held.SenderId, account.AppId, vendId.Value);
-                if (linkResult.IsFailure)
+                List<Dictionary<string, object>> matches = partyType.LookupHndName is not null ? await filerDataSvc.GetLookupAsync(partyType.LookupHndName, namedParty) : [];
+                if (matches.Count != 1)
                 {
-                    await mail.ReplyAsync(message.ProvMsgId, "Something went wrong linking this vendor. Please try again or contact support.");
-                    await FinalizeAsync(new MessageFinalization { MsgNo = adminMsgNo, MsgTpCode = "CMD", ResTpCode = "FAILED", MsgResult = $"Failed to link vendor: {linkResult.Message}" });
-                    Tracker.Track($"MsgNo {held.MsgNo}: failed to link VendId {vendId} to SenderId {held.SenderId} ({linkResult.Message}).");
+                    await mail.ReplyAsync(message.ProvMsgId, $"{partyType.PartyTpName} \"{namedParty}\" not found. Please reply with the exact name.");
+                    await FinalizeAsync(new MessageFinalization { MsgNo = adminMsgNo, MsgTpCode = "CMD", ResTpCode = "REVIEW", MsgResult = $"\"{namedParty}\" not found (or ambiguous)." });
+                    Tracker.Track($"ReqNo {req.ReqNo}: \"{namedParty}\" not found (or ambiguous), left pending.");
+                    return;
+                }
+                partyId = Convert.ToInt32(matches[0][partyType.PartyTpKeyField]);
+                partyName = matches[0][partyType.PartyTpNameField]?.ToString();
+            }
+
+            if (isApproved && partyId is null)
+            {
+                await mail.ReplyAsync(message.ProvMsgId, $"Please reply with the name of the {label} to link this sender to.");
+                await FinalizeAsync(new MessageFinalization { MsgNo = adminMsgNo, MsgTpCode = "CMD", ResTpCode = "REVIEW", MsgResult = "No party could be resolved." });
+                Tracker.Track($"ReqNo {req.ReqNo}: no party could be resolved, left pending.");
+                return;
+            }
+
+            var pending = await mailDataSvc.GetApprRequestItemsAsync(req.ReqNo);
+
+            var prepared = new List<HeldMessage>();
+            if (isApproved && partyId is int approvedId)
+            {
+                foreach (var heldMsg in pending)
+                    prepared.Add(await PrepareHeldMessageAsync(account, mail, heldMsg, partyType, approvedId, partyName));
+
+                var mismatches = prepared.SelectMany(p => p.Mismatches).ToList();
+                if (mismatches.Count > 0)
+                {
+                    await mail.ReplyAsync(message.ProvMsgId, $"{string.Join("\n\n", mismatches)}\n\nPlease reply with the correct {label} name (add it to the {label} list first if it's new), or REJECT to decline.");
+                    await FinalizeAsync(new MessageFinalization { MsgNo = adminMsgNo, MsgTpCode = "CMD", ResTpCode = "REVIEW", MsgResult = $"{mismatches.Count} party mismatch(es) -- approval not saved." });
+                    Tracker.Track($"ReqNo {req.ReqNo}: {mismatches.Count} party mismatch(es), approval not saved, left pending.");
                     return;
                 }
             }
 
-            await mailDataSvc.SaveMessageResolutionAsync(new MessageResolution
+            var resolveResult = await mailDataSvc.SaveMessageResolutionAsync(new MessageResolution
             {
-                SenderId = held.SenderId,
-                VendId = vendId.Value,
-                AnchorMsgNo = held.MsgNo,
+                ReqNo = req.ReqNo,
+                PartyId = partyId,
                 IsApproved = isApproved,
                 CmdCode = cmdResult.Value.CmdCode!,
                 AdminMsgNo = adminMsgNo,
-                Reference = $"SenderId {held.SenderId}, VendId {vendId.Value}",
+                Reference = $"SenderId {req.SenderId}, PartyId {partyId}",
                 ResultCode = 0,
                 ResultMsg = isApproved ? "Approved" : "Rejected"
             });
 
-            Tracker.Track($"{message.FromAddr}: {(isApproved ? "approved" : "rejected")} VendId {vendId} -- {pending.Count} message(s) affected.");
+            if (resolveResult.IsFailure)
+            {
+                await mail.ReplyAsync(message.ProvMsgId, "Something went wrong recording that decision. Please try again or contact support.");
+                await FinalizeAsync(new MessageFinalization { MsgNo = adminMsgNo, MsgTpCode = "CMD", ResTpCode = "FAILED", MsgResult = $"Failed to save resolution: {resolveResult.Message}" });
+                Tracker.Track($"ReqNo {req.ReqNo}: failed to save resolution ({resolveResult.Message}).");
+                return;
+            }
 
-            if (isApproved)
+            Tracker.Track($"{message.FromAddr}: {(isApproved ? "approved" : "rejected")} ReqNo {req.ReqNo} (PartyId {partyId}) -- {pending.Count} message(s) affected.");
+
+            if (!isApproved)
                 foreach (var heldMsg in pending)
-                    await ReprocessHeldMessageAsync(account, mail, heldMsg, held.SenderId, msgTypes, fieldsByMsgType);
+                    await FinalizeAsync(new MessageFinalization { MsgNo = heldMsg.MsgNo, ResTpCode = "REJECTED", MsgResult = "Sender rejected by administrator." });
+            else if (partyId is int linkedId)
+                foreach (var held in prepared)
+                    await ReprocessHeldMessageAsync(account, mail, held, req.SenderId, partyType, linkedId, partyName, msgTypes, fieldsByMsgType);
 
             await mail.ReplyAsync(message.ProvMsgId, isApproved
-                ? $"Your approval was processed. Sender {held.FromAddr} was linked to vendor {vendName}. {pending.Count} held message(s) will be processed. Please check for individual results."
-                : $"Rejected. {pending.Count} message(s) were declined.");
+                ? $"Your approval was processed. Sender {req.FromAddr} was linked to {partyName}. {pending.Count} pending message(s) will be processed. Please check for individual results."
+                : $"Rejected. Sender {req.FromAddr} was not linked. {pending.Count} pending message(s) were declined.");
 
             await FinalizeAsync(new MessageFinalization { MsgNo = adminMsgNo, MsgTpCode = "CMD", ResTpCode = "OK" });
         }
         private async Task FinalizeAsync(MessageFinalization finalize)
-        // Every terminal write goes through here instead of calling mailDataSvc.FinalizeMessageAsync
-        // directly -- a failed write here used to be silently swallowed (the caller's own Tracker.Track
-        // line ran regardless, logging a false "success" even when nothing was actually persisted). This
-        // is the fix for that: the intended outcome always gets logged distinctly from whether it was
-        // actually written.
         {
             var result = await mailDataSvc.SaveMessageFinalizationAsync(finalize);
             if (result.IsFailure)

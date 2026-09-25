@@ -17,7 +17,6 @@ namespace EMF.Mail;
 
 public static class Program
 {
-
     public static async Task Main()
     {
         var config = new ConfigurationBuilder()
@@ -45,7 +44,7 @@ public static class Program
 
         // One processor for every account, regardless of AppId -- see MessageProcessor for how it reads
         // sender-approval gating and doc-vs-fields package creation from account/data config instead.
-        var processor = new MessageProcessor(mailDataSvc, filerDataSvc, cmdSvc, classifier, filer, conv);
+        var processor = new MessageProcessor(mailDataSvc, filerDataSvc, cmdSvc, classifier, filer, conv, dms);
 
         while (true)
         {
