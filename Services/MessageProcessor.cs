@@ -15,7 +15,7 @@ using FilerDataService = EMF.FilerSvc.Services.DataService;
 
 namespace EMF.Mail.Services
 {
-    // Code Description ==================================================================================
+    // Header Section ==================================================================================
     // Author: Bernie Cheing
     // 
     // MessageProcessor -- single processor for every app (TriageService/MsgTypeProcessor retired).
@@ -37,9 +37,11 @@ namespace EMF.Mail.Services
     // normal classification so it is never re-triaged as a fresh SUB/INQ.
     //
     // ProcessInboundMessageAsync / ClassifyMessageAsync
-    // Log, classify, then hold or process. Approval applies only when the SUB entity has
-    // IsApprRequired (matched by MsgTpCode "SUB", not by field-map order). Entities without it (e.g.
-    // LSM Vehicle Shipment) always send every attachment and skip the hold/approve path.
+    // Log, classify, then hold or process. The hold gate uses the CLASSIFIED message type's own
+    // IsApprRequired (SUB and INQ today); an unclassifiable message (MsgTpCode null) is never held --
+    // it goes to REVIEW. Types without approval (e.g. LSM Vehicle Shipment) always send every
+    // attachment and skip the hold/approve path. AssignAnchors runs right after classification, so a
+    // held context and an immediate save agree.
     // FIRST-CONTACT RULE: an unknown sender's attachments are never opened (spam, oversized or
     // compromised files) -- classification uses the email text only; files are opened only after an
     // admin approves the sender. A known sender's attachments are sent on the first pass.
@@ -75,18 +77,15 @@ namespace EMF.Mail.Services
     //
     // PrepareHeldMessageAsync -- post-approval only
     // Refetches the original, reads the saved MsgContext, and opens any anchor not yet extracted
-    // (Filer.ClassifyAndExtractAsync -- extract only, nothing saved). New extractions are written back
-    // with /filer/msg/context (MsgContext only; message stays HELD) so a later reply never reopens the
-    // file. Each package's party is then compared to the approved one -- source is the anchor's
+    // (Filer.ClassifyAndExtractAsync -- extract only, nothing saved).
+    // Anchor choice is data-driven (AssignAnchors): an attachment whose DocTpId belongs to the classified
+    // entity's RecTpId becomes the package anchor when Claude chose none (promote only, never demote).
+    // A package still without an anchor has its unlabeled files opened; the first that classifies as
+    // the entity's own record type is promoted and its extraction kept.
+    // MsgContext is written back once, at the end (/filer/msg/context; message stays HELD), after any
+    // discard below, so a later reply never reopens a file whose result was kept.
+    // Each package's party is then compared to the approved one -- source is the anchor's
     // ExtractedFields when present, otherwise the body Fields:
-    //   same id      -> match
-    //   no id found  -> body-only package: approved party fills it; anchor document: blocks the
-    //                   approval like a mismatch, and the extraction is discarded (not saved) so the
-    //                   file is re-read once the party has been added to the party list
-    //   different id -> mismatch; the approved party NEVER overrides the document
-    // A mismatch in any package holds the whole message -- a rogue invoice from an approved sender
-    // must never be processed. Failures (refetch, unreadable context) are not finalized here, so they
-    // are retried on the admin's next reply if the approval is not yet written.
     //
     // ReprocessHeldMessageAsync -- after the approval is written
     // Refetch failed -> FAILED. Unreadable MsgContext -> REVIEW + forwarded to admin. An anchor that
@@ -163,7 +162,7 @@ namespace EMF.Mail.Services
                         }
                         else if (string.Equals(message.FromAddr, account.AdmAcctEMail, StringComparison.OrdinalIgnoreCase))
                         {
-                            await ProcessAdminReplyAsync(account, mail, message, msgTypes, fieldsByMsgType);
+                            await ProcessAdminReplyAsync(account, mail, message, docTypes, msgTypes, fieldsByMsgType);
                         }
                         else
                         {
@@ -277,6 +276,18 @@ namespace EMF.Mail.Services
             if (GetFieldInt(fields, partyType.PartyTpKeyField) is not null) return;
             fields[partyType.PartyTpKeyField] = partyId;
             if (partyName is not null) fields[partyType.PartyTpNameField] = partyName;
+        }
+        private static void AssignAnchors(ClassifyResult result, List<DocType> docTypes, List<MsgType> msgTypes)
+        {
+            var recTpId = msgTypes.FirstOrDefault(t => t.MsgTpCode == result.MsgTpCode)?.RecTpId;
+            if (recTpId is null) return;
+
+            var anchorTypes = docTypes.Where(d => d.RecTpId == recTpId).Select(d => d.DocTpId).ToHashSet();
+            foreach (var pkg in result.Packages.Where(p => !p.Attachments.Any(a => a.IsPackage)))
+            {
+                var anchor = pkg.Attachments.FirstOrDefault(a => a.DocTpId is int docTpId && anchorTypes.Contains(docTpId));
+                if (anchor is not null) anchor.IsPackage = true;
+            }
         }
         #endregion
 
@@ -514,6 +525,7 @@ namespace EMF.Mail.Services
             }
 
             var result = classifyResult.Value;
+            AssignAnchors(result, docTypes, msgTypes);
             var pkgFields = result.Packages.FirstOrDefault()?.Fields;
             var candidatePartyId = partyType is not null ? GetFieldInt(pkgFields, partyType.PartyTpKeyField) : null;
             var classifiedType = msgTypes.FirstOrDefault(t => t.MsgTpCode == result.MsgTpCode);
@@ -661,7 +673,7 @@ namespace EMF.Mail.Services
                 Tracker.Track($"IReqNo {bridge.IReqNo}: {remaining.Count} item(s) still outstanding after reply, closed (no re-ask), admin notified.");
             }
         }
-        private async Task<HeldMessage> PrepareHeldMessageAsync(MailAccount account, IMailService mail, ApprRequestItem heldMsg, PartyType partyType, int partyId, string? partyName)
+        private async Task<HeldMessage> PrepareHeldMessageAsync(MailAccount account, IMailService mail, ApprRequestItem heldMsg, List<DocType> docTypes, List<MsgType> msgTypes, PartyType partyType, int partyId, string? partyName)
         {
             var orig = await mail.GetMessageByIdAsync(heldMsg.MsgId);
             if (orig is null) return new HeldMessage(heldMsg, null, null, false, []);
@@ -678,6 +690,7 @@ namespace EMF.Mail.Services
             }
             if (result is null) return new HeldMessage(heldMsg, orig, null, false, []);
 
+            AssignAnchors(result, docTypes, msgTypes);
             var isExtracted = false;
             foreach (var anchor in result.Packages.SelectMany(p => p.Attachments).Where(a => a.IsPackage && a.ExtractedFields is null))
             {
@@ -696,9 +709,30 @@ namespace EMF.Mail.Services
                 isExtracted = true;
             }
 
-            if (isExtracted)
-                await mailDataSvc.SaveMessageContextAsync(heldMsg.MsgNo, result);
+            var recTpId = msgTypes.FirstOrDefault(t => t.MsgTpCode == result.MsgTpCode)?.RecTpId;
+            foreach (var pkg in result.Packages.Where(p => !p.Attachments.Any(a => a.IsPackage)))
+            {
+                foreach (var candidate in pkg.Attachments.Where(a => a.DocTpId is null))
+                {
+                    var file = orig.Attachments.FirstOrDefault(a => a.FileName == candidate.FileName);
+                    if (file is null) continue;
 
+                    var extracted = await filer.ClassifyAndExtractAsync(account.AppId, file.Bytes, file.MediaType, file.FileName);
+                    if (extracted.IsFailure)
+                    {
+                        Tracker.Track($"MsgNo {heldMsg.MsgNo}: extraction of {file.FileName} failed ({extracted.Message}).");
+                        continue;
+                    }
+
+                    candidate.DocTpId = extracted.Value.DocType.DocTpId;
+                    isExtracted = true;
+                    if (extracted.Value.DocType.RecTpId != recTpId) continue;
+
+                    candidate.IsPackage = true;
+                    candidate.ExtractedFields = extracted.Value.Fields;
+                    break;
+                }
+            }
             var isVerified = !result.Packages.SelectMany(p => p.Attachments).Any(a => a.IsPackage && a.ExtractedFields is null);
 
             var label = partyType.PartyTpName.ToLower();
@@ -771,7 +805,7 @@ namespace EMF.Mail.Services
 
             await ProcessClassifiedMessageAsync(account, mail, held.Orig, msgNo, senderId, msgTypes, fieldsByMsgType, held.Result, saveContext: false);
         }
-        private async Task ProcessAdminReplyAsync(MailAccount account, IMailService mail, Message message, List<MsgType> msgTypes, Dictionary<int, List<ClaudeFieldSpec>> fieldsByMsgType)
+        private async Task ProcessAdminReplyAsync(MailAccount account, IMailService mail, Message message, List<DocType> docTypes, List<MsgType> msgTypes, Dictionary<int, List<ClaudeFieldSpec>> fieldsByMsgType)
         {
             var msgId = message.InternetMessageId ?? message.ProvMsgId;
 
@@ -873,7 +907,7 @@ namespace EMF.Mail.Services
             if (isApproved && partyId is int approvedId)
             {
                 foreach (var heldMsg in pending)
-                    prepared.Add(await PrepareHeldMessageAsync(account, mail, heldMsg, partyType, approvedId, partyName));
+                    prepared.Add(await PrepareHeldMessageAsync(account, mail, heldMsg, docTypes, msgTypes, partyType, approvedId, partyName));
 
                 var mismatches = prepared.SelectMany(p => p.Mismatches).ToList();
                 if (mismatches.Count > 0)
