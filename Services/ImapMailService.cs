@@ -54,7 +54,7 @@ namespace EMF.Mail.Services
             foreach (var uid in uids)
             {
                 var mime = await inbox.GetMessageAsync(uid);
-                messages.Add(MapMessage(mime, uidValidity, uid));
+                messages.Add(GetMappedMessage(mime, uidValidity, uid));
             }
 
             var newLastUid = uids.Count > 0 ? uids.Max(u => u.Id) : lastUid;
@@ -73,7 +73,7 @@ namespace EMF.Mail.Services
             if (uids.Count == 0) return null;
 
             var mime = await inbox.GetMessageAsync(uids[0]);
-            return MapMessage(mime, inbox.UidValidity, uids[0]);
+            return GetMappedMessage(mime, inbox.UidValidity, uids[0]);
         }
         public async Task FlagProcessedAsync(string provMsgId)
         {
@@ -117,7 +117,7 @@ namespace EMF.Mail.Services
             var inbox = await GetInboxAsync(imap, FolderAccess.ReadOnly);
             var orig = await inbox.GetMessageAsync(uid);
 
-            await SendAsync(BuildForward(_account, orig, toAddr, comment));
+            await SendAsync(GetBuiltMessage(_account, orig, toAddr, comment));
         }
         // Message-Id is generated here (not server-assigned post-send the way Graph's createForward is) --
         // set via MimeMessage.MessageId (bare id) and read back via the raw header (bracketed), so the
@@ -130,7 +130,7 @@ namespace EMF.Mail.Services
             var inbox = await GetInboxAsync(imap, FolderAccess.ReadOnly);
             var orig = await inbox.GetMessageAsync(uid);
 
-            var forward = BuildForward(_account, orig, toAddr, comment);
+            var forward = GetBuiltMessage(_account, orig, toAddr, comment);
             await SendAsync(forward);
 
             return forward.Headers[HeaderId.MessageId];
@@ -228,7 +228,7 @@ namespace EMF.Mail.Services
         // bracketed format Graph's InternetMessageId already carries, since these values are compared
         // verbatim against msg.TblMessages.FwdMsgId/SentMsgId regardless of which provider wrote them.
 
-        private static Message MapMessage(MimeMessage mime, uint uidValidity, UniqueId uid) => new()
+        private static Message GetMappedMessage(MimeMessage mime, uint uidValidity, UniqueId uid) => new()
         {
             ProvMsgId = $"{uidValidity}:{uid.Id}",
             InternetMessageId = mime.Headers[HeaderId.MessageId],
@@ -252,19 +252,19 @@ namespace EMF.Mail.Services
         // helper, so the original is attached here as a real .eml (message/rfc822) part -- simple, and
         // (unlike Reply's inline quoting) worth doing regardless of "start simple": an approval-hold
         // forward with nothing attached to review would defeat its own purpose.
-        private static MimeMessage BuildForward(ImapAccount account, MimeMessage orig, string toAddr, string comment)
+        private static MimeMessage GetBuiltMessage(ImapAccount account, MimeMessage orig, string toAddr, string comment)
         {
-            var forward = new MimeMessage();
-            forward.From.Add(MailboxAddress.Parse(account.AcctName));
-            forward.To.Add(MailboxAddress.Parse(toAddr));
-            forward.Subject = orig.Subject is not null && orig.Subject.StartsWith("Fwd:", StringComparison.OrdinalIgnoreCase) ? orig.Subject : $"Fwd: {orig.Subject}";
-            forward.MessageId = MimeUtils.GenerateMessageId();
-            forward.Body = new Multipart("mixed")
+            var msg = new MimeMessage();
+            msg.From.Add(MailboxAddress.Parse(account.AcctName));
+            msg.To.Add(MailboxAddress.Parse(toAddr));
+            msg.Subject = orig.Subject is not null && orig.Subject.StartsWith("Fwd:", StringComparison.OrdinalIgnoreCase) ? orig.Subject : $"Fwd: {orig.Subject}";
+            msg.MessageId = MimeUtils.GenerateMessageId();
+            msg.Body = new Multipart("mixed")
             {
                 new TextPart("plain") { Text = comment },
                 new MessagePart("rfc822") { Message = orig }
             };
-            return forward;
+            return msg;
         }
         private static void SetThreadingHeaders(MimeMessage outgoing, MimeMessage orig)
         {
