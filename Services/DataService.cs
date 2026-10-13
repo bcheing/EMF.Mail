@@ -16,7 +16,7 @@ namespace EMF.Mail.Services
         public Task<ApprRequest> GetOpenRequestAsync(int senderId, int partyTpId) => db.GetObjAsync<ApprRequest>("/msg/mail/senderholds", senderId, partyTpId);
         public Task<List<ApprRequestItem>> GetApprRequestItemsAsync(int reqNo) => db.GetTListAsync<ApprRequestItem>("/msg/mail/apprrequestitems", reqNo);
         public Task<List<int?>> GetSenderPartyIdsAsync(int senderId, int partyTpId) => db.GetScalarListAsync<int?>("/msg/mail/permissions", senderId, partyTpId);
-        public Task<List<PkgTask>> GetPkgTasksAsync(List<int> pkgNos) => db.GetTListAsync<PkgTask>("/ap/pkg/tasks", pkgNos); // gap-check covers every PkgNo in one call; caller filters IsComplete
+        public Task<List<PkgTask>> GetPkgTasksAsync(string hndName, List<int> pkgNos) => db.GetTListAsync<PkgTask>(hndName, pkgNos); // gap-check covers every PkgNo in one call; caller filters IsComplete
         public Task<List<Dictionary<string, object>>> GetRecordsAsync(string hndName, params object[] parameters) => db.GetDictListAsync(hndName, parameters);
 
         // DB Writes

@@ -100,11 +100,11 @@ namespace EMF.Mail.Services
     // several files with the same name each resolve at most once. A null lookup key is passed to the
     // GetHndName proc as a real NULL, not "".
     //
-    // CheckAndRequestMissingDocsAsync -- RFI
-    // Runs after a submission's items are saved, only for IsApprRequired entities. One gap-check call
-    // covers all PkgNos; one msg.TblInfoRequests row and one email per PkgNo with gaps (keeps the
-    // rfibridge match unambiguous). PHASE 3: the IsApprRequired gate is a leftover and unrelated to
-    // RFI -- remove it; the AP-only gap check (/ap/pkg/tasks) must become per-MsgType config.
+    // CheckAndRequestMissingDocsAsync -- request for missing docs
+    // Runs after a submission's items are saved, only when the message type's IsTaskCheckRequired is set
+    // and the app has an OnTasksGet handler (dms.LstApps). One call covers all PkgNos; one
+    // msg.TblInfoRequests row and one email per PkgNo with missing docs (keeps the rfibridge match
+    // unambiguous).
     //
     // ProcessInfoReplyAsync -- reply to an open RFI
     // Attachments are classified only against that package's outstanding gaps and attached with the
@@ -162,7 +162,7 @@ namespace EMF.Mail.Services
                         }
                         else if (string.Equals(message.FromAddr, account.AdmAcctEMail, StringComparison.OrdinalIgnoreCase))
                         {
-                            await ProcessAdminReplyAsync(account, mail, message, docTypes, msgTypes, fieldsByMsgType);
+                            await ProcessAdminReplyAsync(account, mail, message, process, docTypes, msgTypes, fieldsByMsgType);
                         }
                         else
                         {
@@ -170,10 +170,10 @@ namespace EMF.Mail.Services
                             // instead of being triaged again as a fresh Submission/Inquiry.
                             var rfiBridge = await mailDataSvc.GetRfiBridgeAsync(message.BridgeMsgIds);
 
-                            if (rfiBridge is not null)
-                                await ProcessInfoRequestReplyAsync(account, mail, message, rfiBridge, docTypes, process?.ProcessDesc ?? "");
+                            if (rfiBridge is not null && process?.OnTasksGet is string tasksHndName)
+                                await ProcessInfoRequestReplyAsync(account, mail, message, rfiBridge, docTypes, process.ProcessDesc, tasksHndName);
                             else
-                                await ProcessInboundMessageAsync(account, mail, docTypes, msgTypes, fieldsByMsgType, process?.ProcessDesc ?? "", message);
+                                await ProcessInboundMessageAsync(account, mail, docTypes, msgTypes, fieldsByMsgType, process, message);
                         }
                     }
                     catch (Exception ex)
@@ -326,9 +326,9 @@ namespace EMF.Mail.Services
             var result = await classifier.ClassifyEmailAsync(content, processDesc, msgTypeOptions, docTypeOptions, fieldsByMsgType, includeExtraction);
             return (result, partyIds, partyType);
         }
-        private async Task CheckAndRequestMissingDocsAsync(IMailService mail, Message message, string fromAddr, int msgNo, List<int> pkgNos)
+        private async Task CheckAndRequestMissingDocsAsync(IMailService mail, Message message, string fromAddr, int msgNo, string tasksHndName, List<int> pkgNos)
         {
-            var tasks = await mailDataSvc.GetPkgTasksAsync(pkgNos);
+            var tasks = await mailDataSvc.GetPkgTasksAsync(tasksHndName, pkgNos);
 
             foreach (var group in tasks.GroupBy(t => t.PkgNo))
             {
@@ -394,7 +394,7 @@ namespace EMF.Mail.Services
             await FinalizeAsync(new MessageFinalization { MsgNo = msgResult.Value.MsgNo, ResTpCode = "NOOP", MsgResult = "Message from the account's own mailbox address, not a real submission." });
             Tracker.Track($"MsgNo {msgResult.Value.MsgNo}: message from the account's own address, logged and skipped.");
         }
-        private async Task ProcessClassifiedMessageAsync(MailAccount account, IMailService mail, Message message, int msgNo, int senderId, List<MsgType> msgTypes, Dictionary<int, List<ClaudeFieldSpec>> fieldsByMsgType, ClassifyResult result, bool saveContext)
+        private async Task ProcessClassifiedMessageAsync(MailAccount account, IMailService mail, Message message, int msgNo, int senderId, AppProcess? process, List<MsgType> msgTypes, Dictionary<int, List<ClaudeFieldSpec>> fieldsByMsgType, ClassifyResult result, bool saveContext)
         {
             var context = saveContext ? result : null;
 
@@ -456,8 +456,8 @@ namespace EMF.Mail.Services
             }
 
             var attachmentTuples = message.Attachments.Select(a => (a.FileName, a.Bytes, a.MediaType)).ToList();
-            var created = await filer.SavePackagesAsync(msgNo, account.AppId, account.OwnerUId, msgType, result.MsgTpCode, result.Packages, attachmentTuples);
-            var items = created.Select(c => new MessageItem { MsgNo = msgNo, PkgNo = c.PkgNo, DocNo = c.DocNo }).ToList();
+            var (pkgDocs, unlinkedDocNos) = await filer.SavePackagesAsync(msgNo, account.AppId, account.OwnerUId, msgType, result.MsgTpCode, result.Packages, attachmentTuples);
+            var items = pkgDocs.Select(c => new MessageItem { MsgNo = msgNo, PkgNo = c.PkgNo, DocNo = c.DocNo }).ToList();
 
             if (items.Count > 0)
                 await mailDataSvc.SaveMessageItemsAsync(items);
@@ -465,6 +465,16 @@ namespace EMF.Mail.Services
             var pkgNosCreated = items.Select(i => i.PkgNo).Distinct().ToList();
 
             await mail.FlagProcessedAsync(message.ProvMsgId);
+
+            if (unlinkedDocNos.Count > 0)
+            {
+                var docNoList = string.Join(", ", unlinkedDocNos);
+                await mail.MarkNeedsReviewAsync(message.ProvMsgId);
+                await mail.ForwardAsync(message.ProvMsgId, account.AdmAcctEMail, $"DocNo(s) {docNoList} were saved but could not be linked to a package and need manual review.");
+                await FinalizeAsync(new MessageFinalization { MsgNo = msgNo, MsgContext = context, MsgTpCode = result.MsgTpCode, ResTpCode = "REVIEW", MsgResult = $"DocNo(s) {docNoList} could not be linked to a package." });
+                Tracker.Notify($"MsgNo {msgNo}: DocNo(s) {docNoList} could not be linked to a package");
+                return;
+            }
             var replyBody = msgType.ReplyMessage?.Replace("{numPkgs}", pkgNosCreated.Count.ToString());
 
             if (pkgNosCreated.Count > 0)
@@ -474,18 +484,18 @@ namespace EMF.Mail.Services
 
                 await FinalizeAsync(new MessageFinalization { MsgNo = msgNo, MsgContext = context, MsgTpCode = result.MsgTpCode, ResTpCode = "OK" });
 
-                if (msgType.IsApprRequired)
-                    await CheckAndRequestMissingDocsAsync(mail, message, message.FromAddr, msgNo, pkgNosCreated);
+                if (msgType.IsTaskCheckRequired && process?.OnTasksGet is string tasksHndName)
+                    await CheckAndRequestMissingDocsAsync(mail, message, message.FromAddr, msgNo, tasksHndName, pkgNosCreated);
             }
             else
             {
                 await mail.MarkNeedsReviewAsync(message.ProvMsgId);
                 await mail.ForwardAsync(message.ProvMsgId, account.AdmAcctEMail, "No packages could be created from this message -- see the log for details.");
-                await FinalizeAsync(new MessageFinalization { MsgNo = msgNo, MsgContext = context, MsgTpCode = result.MsgTpCode, ResTpCode = "NOOP", MsgResult = "No packages created from this message." });
+                await FinalizeAsync(new MessageFinalization { MsgNo = msgNo, MsgContext = context, MsgTpCode = result.MsgTpCode, ResTpCode = "REVIEW", MsgResult = "No packages created from this message." });
                 Tracker.Track($"MsgNo {msgNo}: no packages created from this message, admin notified.");
             }
         }
-        private async Task ProcessInboundMessageAsync(MailAccount account, IMailService mail, List<DocType> docTypes, List<MsgType> msgTypes, Dictionary<int, List<ClaudeFieldSpec>> fieldsByMsgType, string processDesc, Message message)
+        private async Task ProcessInboundMessageAsync(MailAccount account, IMailService mail, List<DocType> docTypes, List<MsgType> msgTypes, Dictionary<int, List<ClaudeFieldSpec>> fieldsByMsgType, AppProcess? process, Message message)
         {
             var msgId = message.InternetMessageId ?? message.ProvMsgId;
 
@@ -513,7 +523,7 @@ namespace EMF.Mail.Services
             var senderId = msgResult.Value.SenderId;
 
             Tracker.Track($"MsgNo {msgNo}: classifying message from {message.FromAddr} with {message.Attachments.Count} attachment(s)...");
-            var (classifyResult, partyIds, partyType) = await ClassifyMessageAsync(docTypes, msgTypes, fieldsByMsgType, processDesc, message, senderId);
+            var (classifyResult, partyIds, partyType) = await ClassifyMessageAsync(docTypes, msgTypes, fieldsByMsgType, process?.ProcessDesc ?? "", message, senderId);
 
             if (classifyResult.IsFailure)
             {
@@ -579,9 +589,9 @@ namespace EMF.Mail.Services
                 return;
             }
 
-            await ProcessClassifiedMessageAsync(account, mail, message, msgNo, senderId, msgTypes, fieldsByMsgType, result, saveContext: true);
+            await ProcessClassifiedMessageAsync(account, mail, message, msgNo, senderId, process, msgTypes, fieldsByMsgType, result, saveContext: true);
         }
-        private async Task ProcessInfoRequestReplyAsync(MailAccount account, IMailService mail, Message message, RfiBridgeResult bridge, List<DocType> docTypes, string processDesc)
+        private async Task ProcessInfoRequestReplyAsync(MailAccount account, IMailService mail, Message message, RfiBridgeResult bridge, List<DocType> docTypes, string processDesc, string tasksHndName)
         {
             var msgId = message.InternetMessageId ?? message.ProvMsgId;
 
@@ -612,7 +622,7 @@ namespace EMF.Mail.Services
             var replyText = GetPlainText(message.UniqueBody);
             await conv.AppendItemAsync(bridge.ConvNo, "user", $"{replyText}\nAttachments: {(attachments.Count > 0 ? string.Join(", ", attachments.Select(a => a.FileName)) : "none")}");
 
-            var outstanding = (await mailDataSvc.GetPkgTasksAsync([bridge.PkgNo])).Where(t => !t.IsComplete).ToList();
+            var outstanding = (await mailDataSvc.GetPkgTasksAsync(tasksHndName, [bridge.PkgNo])).Where(t => !t.IsComplete).ToList();
 
             // Items collected across the whole reply and saved once below -- was one SaveMessageItemsAsync
             // call per attachment, now a single round trip regardless of how many attachments matched.
@@ -651,7 +661,7 @@ namespace EMF.Mail.Services
                     await mailDataSvc.SaveMessageItemsAsync(items);
             }
 
-            var remaining = (await mailDataSvc.GetPkgTasksAsync([bridge.PkgNo])).Where(t => !t.IsComplete).ToList();
+            var remaining = (await mailDataSvc.GetPkgTasksAsync(tasksHndName, [bridge.PkgNo])).Where(t => !t.IsComplete).ToList();
 
             // Closed unconditionally here -- no resend branch anymore, see method comment above.
             await mailDataSvc.CloseInfoRequestAsync(bridge.IReqNo);
@@ -767,7 +777,7 @@ namespace EMF.Mail.Services
 
             return new HeldMessage(heldMsg, orig, result, isVerified, mismatches);
         }
-        private async Task ReprocessHeldMessageAsync(MailAccount account, IMailService mail, HeldMessage held, int senderId, PartyType partyType, int partyId, string? partyName, List<MsgType> msgTypes, Dictionary<int, List<ClaudeFieldSpec>> fieldsByMsgType)
+        private async Task ReprocessHeldMessageAsync(MailAccount account, IMailService mail, HeldMessage held, int senderId, PartyType partyType, int partyId, string? partyName, AppProcess? process, List<MsgType> msgTypes, Dictionary<int, List<ClaudeFieldSpec>> fieldsByMsgType)
         {
             var msgNo = held.Item.MsgNo;
 
@@ -803,9 +813,9 @@ namespace EMF.Mail.Services
                     FillPartyFields(anchor.ExtractedFields!, partyType, partyId, partyName);
             }
 
-            await ProcessClassifiedMessageAsync(account, mail, held.Orig, msgNo, senderId, msgTypes, fieldsByMsgType, held.Result, saveContext: false);
+            await ProcessClassifiedMessageAsync(account, mail, held.Orig, msgNo, senderId, process, msgTypes, fieldsByMsgType, held.Result, saveContext: false);
         }
-        private async Task ProcessAdminReplyAsync(MailAccount account, IMailService mail, Message message, List<DocType> docTypes, List<MsgType> msgTypes, Dictionary<int, List<ClaudeFieldSpec>> fieldsByMsgType)
+        private async Task ProcessAdminReplyAsync(MailAccount account, IMailService mail, Message message, AppProcess? process, List<DocType> docTypes, List<MsgType> msgTypes, Dictionary<int, List<ClaudeFieldSpec>> fieldsByMsgType)
         {
             var msgId = message.InternetMessageId ?? message.ProvMsgId;
 
@@ -946,7 +956,7 @@ namespace EMF.Mail.Services
                     await FinalizeAsync(new MessageFinalization { MsgNo = heldMsg.MsgNo, ResTpCode = "REJECTED", MsgResult = "Sender rejected by administrator." });
             else if (partyId is int linkedId)
                 foreach (var held in prepared)
-                    await ReprocessHeldMessageAsync(account, mail, held, req.SenderId, partyType, linkedId, partyName, msgTypes, fieldsByMsgType);
+                    await ReprocessHeldMessageAsync(account, mail, held, req.SenderId, partyType, linkedId, partyName, process, msgTypes, fieldsByMsgType);
 
             await mail.ReplyAsync(message.ProvMsgId, isApproved
                 ? $"Your approval was processed. Sender {req.FromAddr} was linked to {partyName}. {pending.Count} pending message(s) will be processed. Please check for individual results."

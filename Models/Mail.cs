@@ -66,7 +66,7 @@ namespace EMF.Mail.Models
     {
         public int MsgNo { get; set; }
         public int PkgNo { get; set; }
-        public int DocNo { get; set; }
+        public int? DocNo { get; set; }
     }
     public class MessageResult 
     { 
