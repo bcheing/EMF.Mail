@@ -4,15 +4,17 @@ using System.Threading.Tasks;
 
 namespace EMF.Mail.Services
 {
-    // Provider-agnostic mail operations MessageProcessor actually calls. GraphMailService is the only
-    // implementation today -- this exists so a future provider only needs to implement this surface,
-    // without MessageProcessor changing at all.
+    // Provider-agnostic mail operations MessageProcessor actually calls, implemented by GraphMailService and
+    // ImapMailService -- a future provider only needs to implement this surface, without MessageProcessor
+    // changing at all.
     public interface IMailService
     {
-        Task<(List<Message> Messages, string DeltaLink)> GetChangedMessagesAsync(string? lastMsgLink);
-        Task<Message?> GetMessageByIdAsync(string internetMessageId);
-        Task<List<MessageHeader>> GetMessageHeadersAsync(int maxCount);
+        Task<(List<InternetMessage> Messages, string DeltaLink)> GetChangedMessagesAsync(string? lastMsgLink);
+        Task<InternetMessage?> GetMessageByIdAsync(string internetMessageId);
+        Task<List<InternetMessageHeader>> GetNewMessageHeadersAsync(string lastMsgLink);
+        [System.Obsolete("Processing status is tracked in msg.TblMessages and shown on the DMS Mail page; the mailbox is no longer flagged or moved.")]
         Task FlagProcessedAsync(string provMsgId);
+        [System.Obsolete("Processing status is tracked in msg.TblMessages and shown on the DMS Mail page; the mailbox is no longer flagged or moved.")]
         Task MarkNeedsReviewAsync(string provMsgId);
         Task ReplyAsync(string provMsgId, string comment);
         Task ForwardAsync(string provMsgId, string toAddr, string comment);

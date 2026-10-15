@@ -131,10 +131,10 @@ namespace EMF.Mail.Services
         [GeneratedRegex(@"\s+")]
         private static partial Regex WhitespaceRegex();
         private static readonly JsonSerializerOptions _jsonOpts = new() { PropertyNameCaseInsensitive = true };
-        private sealed record HeldMessage(ApprRequestItem Item, Message? Orig, ClassifyResult? Result, bool IsVerified, List<string> Mismatches);
+        private sealed record HeldMessage(ApprRequestItem Item, InternetMessage? Orig, ClassifyResult? Result, bool IsVerified, List<string> Mismatches);
 
         #region Public methods. Main entry point from console app.
-        public async Task ProcessAccountAsync(MailAccount account, IMailService mail)
+        public async Task ProcessAccountAsync(Account account, IMailService mail)
         {
             var (messages, deltaLink) = await mail.GetChangedMessagesAsync(account.LastMsgLink);
             Tracker.Track($"Account {account.AcctName}: {messages.Count} message(s) fetched.");
@@ -173,6 +173,11 @@ namespace EMF.Mail.Services
                                 await ProcessInboundMessageAsync(account, mail, app, partyTypes, message);
                         }
                     }
+                    catch (MessageLogException ex)
+                    {
+                        Tracker.Notify($"Account {account.AcctName}: {ex.Message} Run stopped, bookmark not saved.");
+                        return;
+                    }
                     catch (Exception ex)
                     {
                         Tracker.Track($"{message.FromAddr}: unhandled exception processing message ({ex.Message}).");
@@ -183,6 +188,31 @@ namespace EMF.Mail.Services
             var pollResult = await mailDataSvc.SaveMessageBookmarkAsync(new AccountBookmark { AcctId = account.AcctId, LastMsgLink = deltaLink });
             if (pollResult.IsFailure)
                 Tracker.Track($"Account {account.AcctName}: failed to update LastPollDT/LastMsgLink ({pollResult.Message}).");
+        }
+        #endregion
+
+        #region Message log
+        private sealed class MessageLogException(string message) : Exception(message);
+
+        // ai: A message that cannot be logged must not be processed; any failure other than 2627 (already logged) stops the account run.
+        private async Task<Result<MessageResult>> LogMessageAsync(Account account, InternetMessage message)
+        {
+            var msgResult = await mailDataSvc.SaveMessageAsync(new Message
+            {
+                AcctId = account.AcctId,
+                MsgId = message.InternetMessageId ?? message.ProvMsgId,
+                FromAddr = message.FromAddr,
+                FromName = message.FromName,
+                RcptDT = message.ReceivedDateTime,
+                Subject = message.Subject,
+                OrigMsgId = message.OrigMsgId,
+                NumAttachments = (byte)message.Attachments.Count
+            });
+
+            if (msgResult.IsFailure && msgResult.Code != "2627")
+                throw new MessageLogException($"{message.FromAddr}: failed to log message ({msgResult.Message}).");
+
+            return msgResult;
         }
         #endregion
 
@@ -289,7 +319,7 @@ namespace EMF.Mail.Services
         #endregion
 
         #region Private processing methods
-        private async Task<(Result<ClassifyResult> Result, List<int?> PartyIds, PartyType? PartyType)> ClassifyMessageAsync(ApplicationExt app, List<PartyType> partyTypes, Message message, int senderId)
+        private async Task<(Result<ClassifyResult> Result, List<int?> PartyIds, PartyType? PartyType)> ClassifyMessageAsync(ApplicationExt app, List<PartyType> partyTypes, InternetMessage message, int senderId)
         {
             var subType = app.MsgTypes.FirstOrDefault(t => t.MsgTpCode == "SUB");
             var hasLinkGate = subType?.IsApprRequired ?? false;
@@ -323,7 +353,7 @@ namespace EMF.Mail.Services
             var result = await classifier.ClassifyEmailAsync(content, app.ProcessDesc, msgTypeOptions, docTypeOptions, app.FieldsByMsgType, includeExtraction);
             return (result, partyIds, partyType);
         }
-        private async Task CheckAndRequestMissingDocsAsync(IMailService mail, Message message, string fromAddr, int msgNo, string tasksHndName, List<int> pkgNos)
+        private async Task CheckAndRequestMissingDocsAsync(IMailService mail, InternetMessage message, string fromAddr, int msgNo, string tasksHndName, List<int> pkgNos)
         {
             var tasks = await mailDataSvc.GetPkgTasksAsync(tasksHndName, pkgNos);
 
@@ -366,38 +396,21 @@ namespace EMF.Mail.Services
                     Tracker.Track($"PkgNo {group.Key}: sent info request for {gaps.Count} outstanding item(s).");
             }
         }
-        private async Task ProcessSelfSentMessageAsync(MailAccount account, Message message)
+        private async Task ProcessSelfSentMessageAsync(Account account, InternetMessage message)
         {
-            var msgId = message.InternetMessageId ?? message.ProvMsgId;
+            var msgResult = await LogMessageAsync(account, message);
 
-            var msgResult = await mailDataSvc.SaveMessageAsync(new MailMessage
-            {
-                AcctId = account.AcctId,
-                MsgId = msgId,
-                FromAddr = message.FromAddr,
-                FromName = message.FromName,
-                RcptDate = message.ReceivedDateTime,
-                Subject = message.Subject,
-                OrigMsgId = message.OrigMsgId
-            });
-
-            if (msgResult.IsFailure)
-            {
-                if (msgResult.Code != "2627")
-                    Tracker.Track($"{message.FromAddr}: failed to log self-sent message ({msgResult.Message}).");
-                return;
-            }
+            if (msgResult.IsFailure) return;
 
             await FinalizeAsync(new MessageFinalization { MsgNo = msgResult.Value.MsgNo, ResTpCode = "NOOP", MsgResult = "Message from the account's own mailbox address, not a real submission." });
             Tracker.Track($"MsgNo {msgResult.Value.MsgNo}: message from the account's own address, logged and skipped.");
         }
-        private async Task ProcessClassifiedMessageAsync(MailAccount account, IMailService mail, Message message, int msgNo, int senderId, ApplicationExt app, ClassifyResult result, bool saveContext)
+        private async Task ProcessClassifiedMessageAsync(Account account, IMailService mail, InternetMessage message, int msgNo, int senderId, ApplicationExt app, ClassifyResult result, bool saveContext)
         {
             var context = saveContext ? result : null;
 
             if (result.MsgTpCode is null)
             {
-                await mail.MarkNeedsReviewAsync(message.ProvMsgId);
                 await mail.ForwardAsync(message.ProvMsgId, account.AdmAcctEMail, "This message could not be classified and needs manual review.");
                 await FinalizeAsync(new MessageFinalization { MsgNo = msgNo, MsgContext = context, ResTpCode = "REVIEW", MsgResult = "Could not determine message type." });
                 Tracker.Track($"MsgNo {msgNo}: could not classify message, flagged for review.");
@@ -439,7 +452,6 @@ namespace EMF.Mail.Services
                 }
 
                 await mail.ReplyAsync(message.ProvMsgId, reply.Value);
-                await mail.FlagProcessedAsync(message.ProvMsgId);
                 await FinalizeAsync(new MessageFinalization { MsgNo = msgNo, MsgContext = context, MsgTpCode = result.MsgTpCode, ResTpCode = "OK", MsgResult = $"Inquiry reply sent ({matches.Count} match(es) found)." });
                 Tracker.Track($"MsgNo {msgNo}: inquiry reply sent ({matches.Count} match(es) found).");
                 return;
@@ -461,12 +473,9 @@ namespace EMF.Mail.Services
 
             var pkgNosCreated = items.Select(i => i.PkgNo).Distinct().ToList();
 
-            await mail.FlagProcessedAsync(message.ProvMsgId);
-
             if (unlinkedDocNos.Count > 0)
             {
                 var docNoList = string.Join(", ", unlinkedDocNos);
-                await mail.MarkNeedsReviewAsync(message.ProvMsgId);
                 await mail.ForwardAsync(message.ProvMsgId, account.AdmAcctEMail, $"DocNo(s) {docNoList} were saved but could not be linked to a package and need manual review.");
                 await FinalizeAsync(new MessageFinalization { MsgNo = msgNo, MsgContext = context, MsgTpCode = result.MsgTpCode, ResTpCode = "REVIEW", MsgResult = $"DocNo(s) {docNoList} could not be linked to a package." });
                 Tracker.Notify($"MsgNo {msgNo}: DocNo(s) {docNoList} could not be linked to a package");
@@ -486,33 +495,18 @@ namespace EMF.Mail.Services
             }
             else
             {
-                await mail.MarkNeedsReviewAsync(message.ProvMsgId);
                 await mail.ForwardAsync(message.ProvMsgId, account.AdmAcctEMail, "No packages could be created from this message -- see the log for details.");
                 await FinalizeAsync(new MessageFinalization { MsgNo = msgNo, MsgContext = context, MsgTpCode = result.MsgTpCode, ResTpCode = "REVIEW", MsgResult = "No packages created from this message." });
                 Tracker.Track($"MsgNo {msgNo}: no packages created from this message, admin notified.");
             }
         }
-        private async Task ProcessInboundMessageAsync(MailAccount account, IMailService mail, ApplicationExt app, List<PartyType> partyTypes, Message message)
+        private async Task ProcessInboundMessageAsync(Account account, IMailService mail, ApplicationExt app, List<PartyType> partyTypes, InternetMessage message)
         {
-            var msgId = message.InternetMessageId ?? message.ProvMsgId;
-
-            var msgResult = await mailDataSvc.SaveMessageAsync(new MailMessage
-            {
-                AcctId = account.AcctId,
-                MsgId = msgId,
-                FromAddr = message.FromAddr,
-                FromName = message.FromName,
-                RcptDate = message.ReceivedDateTime,
-                Subject = message.Subject,
-                OrigMsgId = message.OrigMsgId
-            });
+            var msgResult = await LogMessageAsync(account, message);
 
             if (msgResult.IsFailure)
             {
-                if (msgResult.Code == "2627")
-                    Tracker.Track($"{message.FromAddr}: message already logged, skipping.");
-                else
-                    Tracker.Track($"{message.FromAddr}: failed to log message ({msgResult.Message}).");
+                Tracker.Track($"{message.FromAddr}: message already logged, skipping.");
                 return;
             }
 
@@ -524,7 +518,6 @@ namespace EMF.Mail.Services
 
             if (classifyResult.IsFailure)
             {
-                await mail.MarkNeedsReviewAsync(message.ProvMsgId);
                 await mail.ForwardAsync(message.ProvMsgId, account.AdmAcctEMail, "This message could not be classified and needs manual review.");
                 await FinalizeAsync(new MessageFinalization { MsgNo = msgNo, ResTpCode = "REVIEW", MsgResult = $"Claude classification failed: {classifyResult.Message}" });
                 Tracker.Track($"MsgNo {msgNo}: Claude classification failed ({classifyResult.Message}).");
@@ -588,27 +581,13 @@ namespace EMF.Mail.Services
 
             await ProcessClassifiedMessageAsync(account, mail, message, msgNo, senderId, app, result, saveContext: true);
         }
-        private async Task ProcessInfoRequestReplyAsync(MailAccount account, IMailService mail, Message message, RfiBridgeResult bridge, ApplicationExt app, string tasksHndName)
+        private async Task ProcessInfoRequestReplyAsync(Account account, IMailService mail, InternetMessage message, InfoRequestBridge bridge, ApplicationExt app, string tasksHndName)
         {
-            var msgId = message.InternetMessageId ?? message.ProvMsgId;
-
-            var msgResult = await mailDataSvc.SaveMessageAsync(new MailMessage
-            {
-                AcctId = account.AcctId,
-                MsgId = msgId,
-                FromAddr = message.FromAddr,
-                FromName = message.FromName,
-                RcptDate = message.ReceivedDateTime,
-                Subject = message.Subject,
-                OrigMsgId = message.OrigMsgId
-            });
+            var msgResult = await LogMessageAsync(account, message);
 
             if (msgResult.IsFailure)
             {
-                if (msgResult.Code == "2627")
-                    Tracker.Track($"{message.FromAddr}: RFI reply already logged, skipping.");
-                else
-                    Tracker.Track($"{message.FromAddr}: failed to log RFI reply ({msgResult.Message}).");
+                Tracker.Track($"{message.FromAddr}: RFI reply already logged, skipping.");
                 return;
             }
 
@@ -680,7 +659,7 @@ namespace EMF.Mail.Services
                 Tracker.Track($"IReqNo {bridge.IReqNo}: {remaining.Count} item(s) still outstanding after reply, closed (no re-ask), admin notified.");
             }
         }
-        private async Task<HeldMessage> PrepareHeldMessageAsync(MailAccount account, IMailService mail, ApprRequestItem heldMsg, ApplicationExt app, Party party)
+        private async Task<HeldMessage> PrepareHeldMessageAsync(Account account, IMailService mail, ApprRequestItem heldMsg, ApplicationExt app, Party party)
         {
             var orig = await mail.GetMessageByIdAsync(heldMsg.MsgId);
             if (orig is null) return new HeldMessage(heldMsg, null, null, false, []);
@@ -774,7 +753,7 @@ namespace EMF.Mail.Services
 
             return new HeldMessage(heldMsg, orig, result, isVerified, mismatches);
         }
-        private async Task ReprocessHeldMessageAsync(MailAccount account, IMailService mail, HeldMessage held, int senderId, Party party, ApplicationExt app)
+        private async Task ReprocessHeldMessageAsync(Account account, IMailService mail, HeldMessage held, int senderId, Party party, ApplicationExt app)
         {
             var msgNo = held.Item.MsgNo;
 
@@ -787,7 +766,6 @@ namespace EMF.Mail.Services
 
             if (held.Result is null)
             {
-                await mail.MarkNeedsReviewAsync(held.Orig.ProvMsgId);
                 await mail.ForwardAsync(held.Orig.ProvMsgId, account.AdmAcctEMail, "This message's saved classification could not be read and needs manual review.");
                 await FinalizeAsync(new MessageFinalization { MsgNo = msgNo, ResTpCode = "REVIEW", MsgResult = "Saved MsgContext missing or unreadable on reprocess." });
                 Tracker.Track($"MsgNo {msgNo}: saved MsgContext missing or unreadable on reprocess.");
@@ -796,7 +774,6 @@ namespace EMF.Mail.Services
 
             if (!held.IsVerified)
             {
-                await mail.MarkNeedsReviewAsync(held.Orig.ProvMsgId);
                 await mail.ForwardAsync(held.Orig.ProvMsgId, account.AdmAcctEMail, $"An attachment on this message could not be read to confirm the {party.Type.PartyTpName.ToLower()}, so it was not processed and needs manual review.");
                 await FinalizeAsync(new MessageFinalization { MsgNo = msgNo, ResTpCode = "REVIEW", MsgResult = "Anchor could not be extracted to verify party." });
                 Tracker.Track($"MsgNo {msgNo}: anchor could not be extracted to verify party, sent to review.");
@@ -812,27 +789,13 @@ namespace EMF.Mail.Services
 
             await ProcessClassifiedMessageAsync(account, mail, held.Orig, msgNo, senderId, app, held.Result, saveContext: false);
         }
-        private async Task ProcessAdminReplyAsync(MailAccount account, IMailService mail, ApplicationExt app, List<PartyType> partyTypes, Message message)
+        private async Task ProcessAdminReplyAsync(Account account, IMailService mail, ApplicationExt app, List<PartyType> partyTypes, InternetMessage message)
         {
-            var msgId = message.InternetMessageId ?? message.ProvMsgId;
-
-            var msgResult = await mailDataSvc.SaveMessageAsync(new MailMessage
-            {
-                AcctId = account.AcctId,
-                MsgId = msgId,
-                FromAddr = message.FromAddr,
-                FromName = message.FromName,
-                RcptDate = message.ReceivedDateTime,
-                Subject = message.Subject,
-                OrigMsgId = message.OrigMsgId
-            });
+            var msgResult = await LogMessageAsync(account, message);
 
             if (msgResult.IsFailure)
             {
-                if (msgResult.Code == "2627")
-                    Tracker.Track($"{message.FromAddr}: admin message already logged, skipping.");
-                else
-                    Tracker.Track($"{message.FromAddr}: failed to log admin message ({msgResult.Message}).");
+                Tracker.Track($"{message.FromAddr}: admin message already logged, skipping.");
                 return;
             }
 
@@ -926,7 +889,7 @@ namespace EMF.Mail.Services
                 }
             }
 
-            var resolveResult = await mailDataSvc.SaveMessageResolutionAsync(new MessageResolution
+            var resolveResult = await mailDataSvc.SaveMessageResolutionAsync(new ApprResolution
             {
                 ReqNo = req.ReqNo,
                 PartyId = partyId,

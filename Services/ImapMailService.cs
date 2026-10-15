@@ -28,7 +28,7 @@ namespace EMF.Mail.Services
         // into the same opaque LastMsgLink string Graph's delta link already uses, so no schema change was
         // needed for this. Bootstrap (lastMsgLink null) mirrors Graph's: capture the current high-water
         // mark and return zero messages, rather than walking the mailbox's full history.
-        public async Task<(List<Message> Messages, string DeltaLink)> GetChangedMessagesAsync(string? lastMsgLink)
+        public async Task<(List<InternetMessage> Messages, string DeltaLink)> GetChangedMessagesAsync(string? lastMsgLink)
         {
             using var client = await GetClientAsync();
             var inbox = await GetInboxAsync(client, FolderAccess.ReadOnly);
@@ -50,7 +50,7 @@ namespace EMF.Mail.Services
 
             var uids = await inbox.SearchAsync(SearchQuery.Uids(new UniqueIdRange(new UniqueId(uidValidity, lastUid + 1), UniqueId.MaxValue)));
 
-            var messages = new List<Message>();
+            var messages = new List<InternetMessage>();
             foreach (var uid in uids)
             {
                 var mime = await inbox.GetMessageAsync(uid);
@@ -64,7 +64,7 @@ namespace EMF.Mail.Services
         // Used to reprocess an originally-held message after admin approval. IMAP's HEADER search key is
         // a substring match (RFC 3501), so searching the exact stored Message-Id (brackets included)
         // reliably finds it.
-        public async Task<Message?> GetMessageByIdAsync(string internetMessageId)
+        public async Task<InternetMessage?> GetMessageByIdAsync(string internetMessageId)
         {
             using var client = await GetClientAsync();
             var inbox = await GetInboxAsync(client, FolderAccess.ReadOnly);
@@ -75,16 +75,20 @@ namespace EMF.Mail.Services
             var mime = await inbox.GetMessageAsync(uids[0]);
             return GetMappedMessage(mime, inbox.UidValidity, uids[0]);
         }
-        public async Task<List<MessageHeader>> GetMessageHeadersAsync(int maxCount)
+        public async Task<List<InternetMessageHeader>> GetNewMessageHeadersAsync(string lastMsgLink)
         {
             using var client = await GetClientAsync();
             var inbox = await GetInboxAsync(client, FolderAccess.ReadOnly);
-            if (inbox.Count == 0) return [];
+
+            var (storedValidity, lastUid) = GetLastBookmark(lastMsgLink);
+            if (storedValidity != inbox.UidValidity) return [];
 
             var items = MessageSummaryItems.UniqueId | MessageSummaryItems.Envelope | MessageSummaryItems.Flags | MessageSummaryItems.InternalDate | MessageSummaryItems.BodyStructure;
-            var summaries = await inbox.FetchAsync(Math.Max(0, inbox.Count - maxCount), -1, new FetchRequest(items));
+            var range = new UniqueIdRange(new UniqueId(inbox.UidValidity, lastUid + 1), UniqueId.MaxValue);
+            var summaries = await inbox.FetchAsync(range, new FetchRequest(items));
 
-            return summaries.OrderByDescending(s => s.Index).Select(s => GetMessageHeader(s, inbox.UidValidity)).ToList();
+            // ai: IMAP resolves "lastUid+1:*" to the highest existing UID when nothing is newer, so the last bookmarked message comes back; filter it out.
+            return summaries.Where(s => s.UniqueId.Id > lastUid).OrderByDescending(s => s.UniqueId.Id).Select(s => GetMessageHeader(s, inbox.UidValidity)).ToList();
         }
         public async Task FlagProcessedAsync(string provMsgId)
         {
@@ -239,11 +243,11 @@ namespace EMF.Mail.Services
         // bracketed format Graph's InternetMessageId already carries, since these values are compared
         // verbatim against msg.TblMessages.FwdMsgId/SentMsgId regardless of which provider wrote them.
 
-        private static MessageHeader GetMessageHeader(IMessageSummary summary, uint uidValidity)
+        private static InternetMessageHeader GetMessageHeader(IMessageSummary summary, uint uidValidity)
         {
             var sender = summary.Envelope.From.Mailboxes.FirstOrDefault();
 
-            return new MessageHeader
+            return new InternetMessageHeader
             {
                 ProvMsgId = $"{uidValidity}:{summary.UniqueId.Id}",
                 InternetMessageId = summary.Envelope.MessageId is string msgId ? $"<{msgId}>" : null,
@@ -251,11 +255,10 @@ namespace EMF.Mail.Services
                 FromName = sender?.Name ?? "",
                 Subject = summary.Envelope.Subject ?? "",
                 ReceivedDateTime = summary.InternalDate?.UtcDateTime ?? DateTime.MinValue,
-                IsRead = summary.Flags?.HasFlag(MessageFlags.Seen) ?? false,
                 HasAttachments = summary.Attachments.Any()
             };
         }
-        private static Message GetMappedMessage(MimeMessage mime, uint uidValidity, UniqueId uid) => new()
+        private static InternetMessage GetMappedMessage(MimeMessage mime, uint uidValidity, UniqueId uid) => new()
         {
             ProvMsgId = $"{uidValidity}:{uid.Id}",
             InternetMessageId = mime.Headers[HeaderId.MessageId],
@@ -270,7 +273,7 @@ namespace EMF.Mail.Services
             Attachments = mime.Attachments.OfType<MimePart>()
                 .Select(p => (Part: p, Bytes: GetBinaryContent(p)))
                 .Where(x => x.Bytes.Length > 0)
-                .Select(x => new AttachmentContent(x.Part.FileName ?? "attachment", x.Bytes, Filer.GetMediaType(x.Part.FileName ?? "")))
+                .Select(x => new InternetMessageAttachment(x.Part.FileName ?? "attachment", x.Bytes, Filer.GetMediaType(x.Part.FileName ?? "")))
                 .ToList(),
             OrigMsgId = mime.Headers[HeaderId.InReplyTo],
             BridgeMsgIds = GetBridgeMsgIds(mime)

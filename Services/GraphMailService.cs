@@ -42,7 +42,7 @@ namespace EMF.Mail.Services
         // here on -- our own FlagProcessedAsync/MarkNeedsReviewAsync writes, and the sender's own flag/read/move
         // actions, never come back as phantom "changes" to reprocess. changeType can only be set on this first
         // call of a round -- it rides along inside every later @odata.nextLink/@odata.deltaLink automatically.
-        public async Task<(List<Message> Messages, string DeltaLink)> GetChangedMessagesAsync(string? lastMsgLink)
+        public async Task<(List<InternetMessage> Messages, string DeltaLink)> GetChangedMessagesAsync(string? lastMsgLink)
         {
             var messages = new List<GraphMessage>();
 
@@ -73,7 +73,7 @@ namespace EMF.Mail.Services
 
         // Used to reprocess an originally-held message after admin approval -- the message itself was
         // never staged, so this is a direct filtered lookup (not a sweep) via the MsgId saved at hold time.
-        public async Task<Message?> GetMessageByIdAsync(string internetMessageId)
+        public async Task<InternetMessage?> GetMessageByIdAsync(string internetMessageId)
         {
             var result = await _graph.Users[_mailboxUpn].Messages.GetAsync(cfg =>
             {
@@ -85,7 +85,7 @@ namespace EMF.Mail.Services
             var message = result?.Value?.FirstOrDefault();
             return message is null ? null : MapMessage(message);
         }
-        public Task<List<MessageHeader>> GetMessageHeadersAsync(int maxCount) => throw new NotSupportedException("Listing message headers is not supported for Graph accounts yet.");
+        public Task<List<InternetMessageHeader>> GetNewMessageHeadersAsync(string lastMsgLink) => throw new NotSupportedException("Listing message headers is not supported for Graph accounts yet.");
         public Task FlagProcessedAsync(string provMsgId) => _graph.Users[_mailboxUpn].Messages[provMsgId].PatchAsync(new GraphMessage
         {
             Flag = new FollowupFlag { FlagStatus = FollowupFlagStatus.Flagged }
@@ -135,7 +135,7 @@ namespace EMF.Mail.Services
         }
 
         #region Private methods
-        private static Message MapMessage(GraphMessage message) => new()
+        private static InternetMessage MapMessage(GraphMessage message) => new()
         {
             ProvMsgId = message.Id ?? "",
             InternetMessageId = message.InternetMessageId,
@@ -147,7 +147,7 @@ namespace EMF.Mail.Services
             UniqueBody = message.UniqueBody?.Content ?? message.Body?.Content ?? "",
             Attachments = (message.Attachments?.OfType<FileAttachment>() ?? [])
                 .Where(a => a.ContentBytes is not null)
-                .Select(a => new AttachmentContent(a.Name ?? "", a.ContentBytes!, Filer.GetMediaType(a.Name ?? "")))
+                .Select(a => new InternetMessageAttachment(a.Name ?? "", a.ContentBytes!, Filer.GetMediaType(a.Name ?? "")))
                 .ToList(),
             OrigMsgId = GetOrigMsgId(message),
             BridgeMsgIds = GetBridgeMsgIds(message)
