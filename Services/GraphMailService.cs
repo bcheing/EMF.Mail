@@ -85,6 +85,7 @@ namespace EMF.Mail.Services
             var message = result?.Value?.FirstOrDefault();
             return message is null ? null : MapMessage(message);
         }
+        public Task<List<MessageHeader>> GetMessageHeadersAsync(int maxCount) => throw new NotSupportedException("Listing message headers is not supported for Graph accounts yet.");
         public Task FlagProcessedAsync(string provMsgId) => _graph.Users[_mailboxUpn].Messages[provMsgId].PatchAsync(new GraphMessage
         {
             Flag = new FollowupFlag { FlagStatus = FollowupFlagStatus.Flagged }

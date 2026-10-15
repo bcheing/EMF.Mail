@@ -75,6 +75,17 @@ namespace EMF.Mail.Services
             var mime = await inbox.GetMessageAsync(uids[0]);
             return GetMappedMessage(mime, inbox.UidValidity, uids[0]);
         }
+        public async Task<List<MessageHeader>> GetMessageHeadersAsync(int maxCount)
+        {
+            using var client = await GetClientAsync();
+            var inbox = await GetInboxAsync(client, FolderAccess.ReadOnly);
+            if (inbox.Count == 0) return [];
+
+            var items = MessageSummaryItems.UniqueId | MessageSummaryItems.Envelope | MessageSummaryItems.Flags | MessageSummaryItems.InternalDate | MessageSummaryItems.BodyStructure;
+            var summaries = await inbox.FetchAsync(Math.Max(0, inbox.Count - maxCount), -1, new FetchRequest(items));
+
+            return summaries.OrderByDescending(s => s.Index).Select(s => GetMessageHeader(s, inbox.UidValidity)).ToList();
+        }
         public async Task FlagProcessedAsync(string provMsgId)
         {
             var uid = GetUniqueId(provMsgId);
@@ -228,6 +239,22 @@ namespace EMF.Mail.Services
         // bracketed format Graph's InternetMessageId already carries, since these values are compared
         // verbatim against msg.TblMessages.FwdMsgId/SentMsgId regardless of which provider wrote them.
 
+        private static MessageHeader GetMessageHeader(IMessageSummary summary, uint uidValidity)
+        {
+            var sender = summary.Envelope.From.Mailboxes.FirstOrDefault();
+
+            return new MessageHeader
+            {
+                ProvMsgId = $"{uidValidity}:{summary.UniqueId.Id}",
+                InternetMessageId = summary.Envelope.MessageId is string msgId ? $"<{msgId}>" : null,
+                FromAddr = sender?.Address ?? "",
+                FromName = sender?.Name ?? "",
+                Subject = summary.Envelope.Subject ?? "",
+                ReceivedDateTime = summary.InternalDate?.UtcDateTime ?? DateTime.MinValue,
+                IsRead = summary.Flags?.HasFlag(MessageFlags.Seen) ?? false,
+                HasAttachments = summary.Attachments.Any()
+            };
+        }
         private static Message GetMappedMessage(MimeMessage mime, uint uidValidity, UniqueId uid) => new()
         {
             ProvMsgId = $"{uidValidity}:{uid.Id}",

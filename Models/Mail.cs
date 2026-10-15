@@ -7,6 +7,7 @@ namespace EMF.Mail.Models
     {
         public int AcctId { get; set; }
         public int AppId { get; set; }
+        public int? EntId { get; set; }
         public int OwnerUId { get; set; }
         public string AcctName { get; set; } = string.Empty;
         public string SecretName { get; set; } = string.Empty;
@@ -49,6 +50,17 @@ namespace EMF.Mail.Models
         public List<AttachmentContent> Attachments { get; set; } = [];
         public string? OrigMsgId { get; set; }
         public List<string> BridgeMsgIds { get; set; } = [];
+    }
+    public class MessageHeader
+    {
+        public string ProvMsgId { get; set; } = string.Empty;
+        public string? InternetMessageId { get; set; }
+        public string FromAddr { get; set; } = string.Empty;
+        public string FromName { get; set; } = string.Empty;
+        public string Subject { get; set; } = string.Empty;
+        public DateTime ReceivedDateTime { get; set; }
+        public bool IsRead { get; set; }
+        public bool HasAttachments { get; set; }
     }
     public class MailMessage
     {
@@ -105,6 +117,7 @@ namespace EMF.Mail.Models
         public string? PartyName { get; set; }
     }
     public record AttachmentContent(string FileName, byte[] Bytes, string MediaType);
+    public record Party(EMF.DMS.Client.PartyType Type, int Id, string? Name);
     public class PkgTask
     // Result of /ap/pkg/tasks -- one row per outstanding (or already-satisfied) attachment requirement for
     // a package, per its invoice type (ap.LstInvcTypeDocTypes). Same shape DMS's TaskPane consumes; Mail

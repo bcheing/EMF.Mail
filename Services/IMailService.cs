@@ -11,6 +11,7 @@ namespace EMF.Mail.Services
     {
         Task<(List<Message> Messages, string DeltaLink)> GetChangedMessagesAsync(string? lastMsgLink);
         Task<Message?> GetMessageByIdAsync(string internetMessageId);
+        Task<List<MessageHeader>> GetMessageHeadersAsync(int maxCount);
         Task FlagProcessedAsync(string provMsgId);
         Task MarkNeedsReviewAsync(string provMsgId);
         Task ReplyAsync(string provMsgId, string comment);

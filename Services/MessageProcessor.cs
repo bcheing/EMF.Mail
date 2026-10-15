@@ -31,8 +31,9 @@ namespace EMF.Mail.Services
     // A sender is authorized per (SenderId, PartyTpId, PartyId) in msg.LstSenderPermissions.
     //
     // ProcessAccountAsync
-    // Changed messages are fetched first; msgtypes/doctypes/field config is only fetched when there is
-    // mail to process, and those independent fetches run via Task.WhenAll. Routing order per message:
+    // Changed messages are fetched first; app config (ApplicationExt: process, msgtypes/doctypes/fields)
+    // and party types are fetched once per run, only when there is mail to process, and those
+    // independent fetches run via Task.WhenAll. Routing order per message:
     // self-sent -> admin reply -> RFI reply bridge -> normal inbound. An RFI reply is checked before
     // normal classification so it is never re-triaged as a fresh SUB/INQ.
     //
@@ -140,17 +141,13 @@ namespace EMF.Mail.Services
 
             if (messages.Count > 0)
             {
-                var processDocTypesTask = filerDataSvc.GetProcessAndDocTypesAsync(account.AppId);
-                var msgTypesTask = filerDataSvc.GetMsgTypesAsync(account.AppId);
-                var msgTypeFieldsTask = filerDataSvc.GetMsgTypeFieldsAsync(account.AppId);
+                var appTask = filerDataSvc.GetApplicationExtAsync(account.AppId);
+                var partyTypesTask = dms.GetPartyTypesAsync();
 
-                await Task.WhenAll(processDocTypesTask, msgTypesTask, msgTypeFieldsTask);
+                await Task.WhenAll(appTask, partyTypesTask);
 
-                var (process, docTypes) = processDocTypesTask.Result;
-                var msgTypes = msgTypesTask.Result;
-                var fieldsByMsgType = msgTypeFieldsTask.Result
-                    .GroupBy(f => f.MsgTpId)
-                    .ToDictionary(g => g.Key, g => g.Cast<ClaudeFieldSpec>().ToList());
+                var app = appTask.Result;
+                var partyTypes = partyTypesTask.Result;
 
                 foreach (var message in messages)
                 {
@@ -162,7 +159,7 @@ namespace EMF.Mail.Services
                         }
                         else if (string.Equals(message.FromAddr, account.AdmAcctEMail, StringComparison.OrdinalIgnoreCase))
                         {
-                            await ProcessAdminReplyAsync(account, mail, message, process, docTypes, msgTypes, fieldsByMsgType);
+                            await ProcessAdminReplyAsync(account, mail, app, partyTypes, message);
                         }
                         else
                         {
@@ -170,10 +167,10 @@ namespace EMF.Mail.Services
                             // instead of being triaged again as a fresh Submission/Inquiry.
                             var rfiBridge = await mailDataSvc.GetRfiBridgeAsync(message.BridgeMsgIds);
 
-                            if (rfiBridge is not null && process?.OnTasksGet is string tasksHndName)
-                                await ProcessInfoRequestReplyAsync(account, mail, message, rfiBridge, docTypes, process.ProcessDesc, tasksHndName);
+                            if (rfiBridge is not null && app.OnTasksGet is string tasksHndName)
+                                await ProcessInfoRequestReplyAsync(account, mail, message, rfiBridge, app, tasksHndName);
                             else
-                                await ProcessInboundMessageAsync(account, mail, docTypes, msgTypes, fieldsByMsgType, process, message);
+                                await ProcessInboundMessageAsync(account, mail, app, partyTypes, message);
                         }
                     }
                     catch (Exception ex)
@@ -271,11 +268,11 @@ namespace EMF.Mail.Services
 
             return gaps;
         }    
-        private static void FillPartyFields(Dictionary<string, object> fields, PartyType partyType, int partyId, string? partyName)
+        private static void FillPartyFields(Dictionary<string, object> fields, Party party)
         {
-            if (GetFieldInt(fields, partyType.PartyTpKeyField) is not null) return;
-            fields[partyType.PartyTpKeyField] = partyId;
-            if (partyName is not null) fields[partyType.PartyTpNameField] = partyName;
+            if (GetFieldInt(fields, party.Type.PartyTpKeyField) is not null) return;
+            fields[party.Type.PartyTpKeyField] = party.Id;
+            if (party.Name is not null) fields[party.Type.PartyTpNameField] = party.Name;
         }
         private static void AssignAnchors(ClassifyResult result, List<DocType> docTypes, List<MsgType> msgTypes)
         {
@@ -292,12 +289,12 @@ namespace EMF.Mail.Services
         #endregion
 
         #region Private processing methods
-        private async Task<(Result<ClassifyResult> Result, List<int?> PartyIds, PartyType? PartyType)> ClassifyMessageAsync(List<DocType> docTypes, List<MsgType> msgTypes, Dictionary<int, List<ClaudeFieldSpec>> fieldsByMsgType, string processDesc, Message message, int senderId)
+        private async Task<(Result<ClassifyResult> Result, List<int?> PartyIds, PartyType? PartyType)> ClassifyMessageAsync(ApplicationExt app, List<PartyType> partyTypes, Message message, int senderId)
         {
-            var subType = msgTypes.FirstOrDefault(t => t.MsgTpCode == "SUB");
+            var subType = app.MsgTypes.FirstOrDefault(t => t.MsgTpCode == "SUB");
             var hasLinkGate = subType?.IsApprRequired ?? false;
 
-            var partyType = hasLinkGate ? (await dms.GetPartyTypesAsync()).FirstOrDefault(p => p.PartyTpId == subType!.PartyTpId) : null;
+            var partyType = hasLinkGate ? partyTypes.FirstOrDefault(p => p.PartyTpId == subType!.PartyTpId) : null;
 
             List<SenderHistory> history = [];
             var partyIds = partyType is not null ? await mailDataSvc.GetSenderPartyIdsAsync(senderId, partyType.PartyTpId) : [];
@@ -320,10 +317,10 @@ namespace EMF.Mail.Services
             if (includeExtraction)
                 content.AddRange(message.Attachments.Select(a => new ClaudeContentPart(a.MediaType, Data: a.Bytes)));
 
-            var msgTypeOptions = msgTypes.Select(t => new ClaudeClassification { Id = t.MsgTpId, Code = t.MsgTpCode, Name = t.MsgTpDesc, Desc = t.ClassifyHint ?? t.MsgTpDesc }).ToList();
-            var docTypeOptions = docTypes.Select(d => new ClaudeClassification { Id = d.DocTpId, Code = d.DocTpCode, Name = d.DocTpName, Desc = d.DocTpDesc }).ToList();
+            var msgTypeOptions = app.MsgTypes.Select(t => new ClaudeClassification { Id = t.MsgTpId, Code = t.MsgTpCode, Name = t.MsgTpDesc, Desc = t.ClassifyHint ?? t.MsgTpDesc }).ToList();
+            var docTypeOptions = app.DocTypes.Select(d => new ClaudeClassification { Id = d.DocTpId, Code = d.DocTpCode, Name = d.DocTpName, Desc = d.DocTpDesc }).ToList();
 
-            var result = await classifier.ClassifyEmailAsync(content, processDesc, msgTypeOptions, docTypeOptions, fieldsByMsgType, includeExtraction);
+            var result = await classifier.ClassifyEmailAsync(content, app.ProcessDesc, msgTypeOptions, docTypeOptions, app.FieldsByMsgType, includeExtraction);
             return (result, partyIds, partyType);
         }
         private async Task CheckAndRequestMissingDocsAsync(IMailService mail, Message message, string fromAddr, int msgNo, string tasksHndName, List<int> pkgNos)
@@ -394,7 +391,7 @@ namespace EMF.Mail.Services
             await FinalizeAsync(new MessageFinalization { MsgNo = msgResult.Value.MsgNo, ResTpCode = "NOOP", MsgResult = "Message from the account's own mailbox address, not a real submission." });
             Tracker.Track($"MsgNo {msgResult.Value.MsgNo}: message from the account's own address, logged and skipped.");
         }
-        private async Task ProcessClassifiedMessageAsync(MailAccount account, IMailService mail, Message message, int msgNo, int senderId, AppProcess? process, List<MsgType> msgTypes, Dictionary<int, List<ClaudeFieldSpec>> fieldsByMsgType, ClassifyResult result, bool saveContext)
+        private async Task ProcessClassifiedMessageAsync(MailAccount account, IMailService mail, Message message, int msgNo, int senderId, ApplicationExt app, ClassifyResult result, bool saveContext)
         {
             var context = saveContext ? result : null;
 
@@ -407,7 +404,7 @@ namespace EMF.Mail.Services
                 return;
             }
 
-            var msgType = msgTypes.FirstOrDefault(t => t.MsgTpCode == result.MsgTpCode);
+            var msgType = app.MsgTypes.FirstOrDefault(t => t.MsgTpCode == result.MsgTpCode);
 
             if (msgType is null)
             {
@@ -425,7 +422,7 @@ namespace EMF.Mail.Services
                     return;
                 }
 
-                var fields = fieldsByMsgType.GetValueOrDefault(msgType.MsgTpId) ?? [];
+                var fields = app.FieldsByMsgType.GetValueOrDefault(msgType.MsgTpId) ?? [];
                 var keyFields = fields.Where(f => f.IsKey && f.FieldMode != "Searchable").ToList();
                 var pkgFields = result.Packages.FirstOrDefault()?.Fields;
 
@@ -456,7 +453,7 @@ namespace EMF.Mail.Services
             }
 
             var attachmentTuples = message.Attachments.Select(a => (a.FileName, a.Bytes, a.MediaType)).ToList();
-            var (pkgDocs, unlinkedDocNos) = await filer.SavePackagesAsync(msgNo, account.AppId, account.OwnerUId, msgType, result.MsgTpCode, result.Packages, attachmentTuples);
+            var (pkgDocs, unlinkedDocNos) = await filer.SavePackagesAsync(msgNo, app, account.OwnerUId, msgType, result.MsgTpCode, result.Packages, attachmentTuples);
             var items = pkgDocs.Select(c => new MessageItem { MsgNo = msgNo, PkgNo = c.PkgNo, DocNo = c.DocNo }).ToList();
 
             if (items.Count > 0)
@@ -484,7 +481,7 @@ namespace EMF.Mail.Services
 
                 await FinalizeAsync(new MessageFinalization { MsgNo = msgNo, MsgContext = context, MsgTpCode = result.MsgTpCode, ResTpCode = "OK" });
 
-                if (msgType.IsTaskCheckRequired && process?.OnTasksGet is string tasksHndName)
+                if (msgType.IsTaskCheckRequired && app.OnTasksGet is string tasksHndName)
                     await CheckAndRequestMissingDocsAsync(mail, message, message.FromAddr, msgNo, tasksHndName, pkgNosCreated);
             }
             else
@@ -495,7 +492,7 @@ namespace EMF.Mail.Services
                 Tracker.Track($"MsgNo {msgNo}: no packages created from this message, admin notified.");
             }
         }
-        private async Task ProcessInboundMessageAsync(MailAccount account, IMailService mail, List<DocType> docTypes, List<MsgType> msgTypes, Dictionary<int, List<ClaudeFieldSpec>> fieldsByMsgType, AppProcess? process, Message message)
+        private async Task ProcessInboundMessageAsync(MailAccount account, IMailService mail, ApplicationExt app, List<PartyType> partyTypes, Message message)
         {
             var msgId = message.InternetMessageId ?? message.ProvMsgId;
 
@@ -523,7 +520,7 @@ namespace EMF.Mail.Services
             var senderId = msgResult.Value.SenderId;
 
             Tracker.Track($"MsgNo {msgNo}: classifying message from {message.FromAddr} with {message.Attachments.Count} attachment(s)...");
-            var (classifyResult, partyIds, partyType) = await ClassifyMessageAsync(docTypes, msgTypes, fieldsByMsgType, process?.ProcessDesc ?? "", message, senderId);
+            var (classifyResult, partyIds, partyType) = await ClassifyMessageAsync(app, partyTypes, message, senderId);
 
             if (classifyResult.IsFailure)
             {
@@ -535,10 +532,10 @@ namespace EMF.Mail.Services
             }
 
             var result = classifyResult.Value;
-            AssignAnchors(result, docTypes, msgTypes);
+            AssignAnchors(result, app.DocTypes, app.MsgTypes);
             var pkgFields = result.Packages.FirstOrDefault()?.Fields;
             var candidatePartyId = partyType is not null ? GetFieldInt(pkgFields, partyType.PartyTpKeyField) : null;
-            var classifiedType = msgTypes.FirstOrDefault(t => t.MsgTpCode == result.MsgTpCode);
+            var classifiedType = app.MsgTypes.FirstOrDefault(t => t.MsgTpCode == result.MsgTpCode);
             var isGated = partyType is not null && (classifiedType?.IsApprRequired ?? false);
             var isLinked = !isGated || partyIds.Contains(candidatePartyId) || partyIds.Contains(null);
 
@@ -589,9 +586,9 @@ namespace EMF.Mail.Services
                 return;
             }
 
-            await ProcessClassifiedMessageAsync(account, mail, message, msgNo, senderId, process, msgTypes, fieldsByMsgType, result, saveContext: true);
+            await ProcessClassifiedMessageAsync(account, mail, message, msgNo, senderId, app, result, saveContext: true);
         }
-        private async Task ProcessInfoRequestReplyAsync(MailAccount account, IMailService mail, Message message, RfiBridgeResult bridge, List<DocType> docTypes, string processDesc, string tasksHndName)
+        private async Task ProcessInfoRequestReplyAsync(MailAccount account, IMailService mail, Message message, RfiBridgeResult bridge, ApplicationExt app, string tasksHndName)
         {
             var msgId = message.InternetMessageId ?? message.ProvMsgId;
 
@@ -631,14 +628,14 @@ namespace EMF.Mail.Services
             if (outstanding.Count > 0 && attachments.Count > 0)
             {
                 var options = outstanding
-                    .Select(t => docTypes.FirstOrDefault(d => d.DocTpId == t.DocTypeId))
+                    .Select(t => app.DocTypes.FirstOrDefault(d => d.DocTpId == t.DocTypeId))
                     .Where(d => d is not null)
                     .Select(d => new ClaudeClassification { Id = d!.DocTpId, Code = d.DocTpCode, Name = d.DocTpName, Desc = d.DocTpDesc })
                     .ToList();
 
                 foreach (var attachment in attachments)
                 {
-                    var classifyResult = await classifier.ClassifyAsync(attachment.Bytes, attachment.MediaType, processDesc, options);
+                    var classifyResult = await classifier.ClassifyAsync(attachment.Bytes, attachment.MediaType, app.ProcessDesc, options);
 
                     if (classifyResult.IsFailure || !options.Any(o => o.Id == classifyResult.Value.Id))
                     {
@@ -646,7 +643,7 @@ namespace EMF.Mail.Services
                         continue;
                     }
 
-                    var attachResult = await filer.AttachDocumentAsync(account.AppId, bridge.PkgNo, classifyResult.Value.Id, attachment.Bytes, attachment.FileName);
+                    var attachResult = await filer.AttachDocumentAsync(app, bridge.PkgNo, classifyResult.Value.Id, attachment.Bytes, attachment.FileName);
                     if (attachResult.IsFailure)
                     {
                         Tracker.Track($"IReqNo {bridge.IReqNo}: failed to attach {attachment.FileName} ({attachResult.Message}).");
@@ -683,7 +680,7 @@ namespace EMF.Mail.Services
                 Tracker.Track($"IReqNo {bridge.IReqNo}: {remaining.Count} item(s) still outstanding after reply, closed (no re-ask), admin notified.");
             }
         }
-        private async Task<HeldMessage> PrepareHeldMessageAsync(MailAccount account, IMailService mail, ApprRequestItem heldMsg, List<DocType> docTypes, List<MsgType> msgTypes, PartyType partyType, int partyId, string? partyName)
+        private async Task<HeldMessage> PrepareHeldMessageAsync(MailAccount account, IMailService mail, ApprRequestItem heldMsg, ApplicationExt app, Party party)
         {
             var orig = await mail.GetMessageByIdAsync(heldMsg.MsgId);
             if (orig is null) return new HeldMessage(heldMsg, null, null, false, []);
@@ -700,14 +697,14 @@ namespace EMF.Mail.Services
             }
             if (result is null) return new HeldMessage(heldMsg, orig, null, false, []);
 
-            AssignAnchors(result, docTypes, msgTypes);
+            AssignAnchors(result, app.DocTypes, app.MsgTypes);
             var isExtracted = false;
             foreach (var anchor in result.Packages.SelectMany(p => p.Attachments).Where(a => a.IsPackage && a.ExtractedFields is null))
             {
                 var file = orig.Attachments.FirstOrDefault(a => a.FileName == anchor.FileName);
                 if (file is null) continue;
 
-                var extracted = await filer.ClassifyAndExtractAsync(account.AppId, file.Bytes, file.MediaType, file.FileName);
+                var extracted = await filer.ClassifyAndExtractAsync(app, file.Bytes, file.MediaType, file.FileName);
                 if (extracted.IsFailure)
                 {
                     Tracker.Track($"MsgNo {heldMsg.MsgNo}: extraction of {file.FileName} failed ({extracted.Message}).");
@@ -719,7 +716,7 @@ namespace EMF.Mail.Services
                 isExtracted = true;
             }
 
-            var recTpId = msgTypes.FirstOrDefault(t => t.MsgTpCode == result.MsgTpCode)?.RecTpId;
+            var recTpId = app.MsgTypes.FirstOrDefault(t => t.MsgTpCode == result.MsgTpCode)?.RecTpId;
             foreach (var pkg in result.Packages.Where(p => !p.Attachments.Any(a => a.IsPackage)))
             {
                 foreach (var candidate in pkg.Attachments.Where(a => a.DocTpId is null))
@@ -727,7 +724,7 @@ namespace EMF.Mail.Services
                     var file = orig.Attachments.FirstOrDefault(a => a.FileName == candidate.FileName);
                     if (file is null) continue;
 
-                    var extracted = await filer.ClassifyAndExtractAsync(account.AppId, file.Bytes, file.MediaType, file.FileName);
+                    var extracted = await filer.ClassifyAndExtractAsync(app, file.Bytes, file.MediaType, file.FileName);
                     if (extracted.IsFailure)
                     {
                         Tracker.Track($"MsgNo {heldMsg.MsgNo}: extraction of {file.FileName} failed ({extracted.Message}).");
@@ -745,17 +742,17 @@ namespace EMF.Mail.Services
             }
             var isVerified = !result.Packages.SelectMany(p => p.Attachments).Any(a => a.IsPackage && a.ExtractedFields is null);
 
-            var label = partyType.PartyTpName.ToLower();
+            var label = party.Type.PartyTpName.ToLower();
             var mismatches = new List<string>();
             foreach (var pkg in result.Packages)
             {
                 var anchor = pkg.Attachments.FirstOrDefault(a => a.IsPackage && a.ExtractedFields is not null);
                 var source = anchor?.ExtractedFields ?? pkg.Fields;
 
-                var foundId = GetFieldInt(source, partyType.PartyTpKeyField);
-                if (foundId == partyId) continue;
+                var foundId = GetFieldInt(source, party.Type.PartyTpKeyField);
+                if (foundId == party.Id) continue;
 
-                var foundName = GetFieldString(source, partyType.PartyTpNameField);
+                var foundName = GetFieldString(source, party.Type.PartyTpNameField);
 
                 if (foundId is null)
                 {
@@ -769,7 +766,7 @@ namespace EMF.Mail.Services
                 }
 
                 var docName = anchor is not null ? anchor.FileName : "the email text";
-                mismatches.Add($"The {label} you provided {partyName ?? "(no name)"} with {partyType.PartyTpKeyField} {partyId} does not match what I found in {docName}. I found {foundName ?? "(no name)"} with {partyType.PartyTpKeyField} {foundId}.");
+                mismatches.Add($"The {label} you provided {party.Name ?? "(no name)"} with {party.Type.PartyTpKeyField} {party.Id} does not match what I found in {docName}. I found {foundName ?? "(no name)"} with {party.Type.PartyTpKeyField} {foundId}.");
             }
 
             if (isExtracted)
@@ -777,7 +774,7 @@ namespace EMF.Mail.Services
 
             return new HeldMessage(heldMsg, orig, result, isVerified, mismatches);
         }
-        private async Task ReprocessHeldMessageAsync(MailAccount account, IMailService mail, HeldMessage held, int senderId, PartyType partyType, int partyId, string? partyName, AppProcess? process, List<MsgType> msgTypes, Dictionary<int, List<ClaudeFieldSpec>> fieldsByMsgType)
+        private async Task ReprocessHeldMessageAsync(MailAccount account, IMailService mail, HeldMessage held, int senderId, Party party, ApplicationExt app)
         {
             var msgNo = held.Item.MsgNo;
 
@@ -800,7 +797,7 @@ namespace EMF.Mail.Services
             if (!held.IsVerified)
             {
                 await mail.MarkNeedsReviewAsync(held.Orig.ProvMsgId);
-                await mail.ForwardAsync(held.Orig.ProvMsgId, account.AdmAcctEMail, $"An attachment on this message could not be read to confirm the {partyType.PartyTpName.ToLower()}, so it was not processed and needs manual review.");
+                await mail.ForwardAsync(held.Orig.ProvMsgId, account.AdmAcctEMail, $"An attachment on this message could not be read to confirm the {party.Type.PartyTpName.ToLower()}, so it was not processed and needs manual review.");
                 await FinalizeAsync(new MessageFinalization { MsgNo = msgNo, ResTpCode = "REVIEW", MsgResult = "Anchor could not be extracted to verify party." });
                 Tracker.Track($"MsgNo {msgNo}: anchor could not be extracted to verify party, sent to review.");
                 return;
@@ -808,14 +805,14 @@ namespace EMF.Mail.Services
 
             foreach (var pkg in held.Result.Packages)
             {
-                FillPartyFields(pkg.Fields, partyType, partyId, partyName);
+                FillPartyFields(pkg.Fields, party);
                 foreach (var anchor in pkg.Attachments.Where(a => a.IsPackage && a.ExtractedFields is not null))
-                    FillPartyFields(anchor.ExtractedFields!, partyType, partyId, partyName);
+                    FillPartyFields(anchor.ExtractedFields!, party);
             }
 
-            await ProcessClassifiedMessageAsync(account, mail, held.Orig, msgNo, senderId, process, msgTypes, fieldsByMsgType, held.Result, saveContext: false);
+            await ProcessClassifiedMessageAsync(account, mail, held.Orig, msgNo, senderId, app, held.Result, saveContext: false);
         }
-        private async Task ProcessAdminReplyAsync(MailAccount account, IMailService mail, Message message, AppProcess? process, List<DocType> docTypes, List<MsgType> msgTypes, Dictionary<int, List<ClaudeFieldSpec>> fieldsByMsgType)
+        private async Task ProcessAdminReplyAsync(MailAccount account, IMailService mail, ApplicationExt app, List<PartyType> partyTypes, Message message)
         {
             var msgId = message.InternetMessageId ?? message.ProvMsgId;
 
@@ -853,7 +850,7 @@ namespace EMF.Mail.Services
 
             Tracker.Track($"Admin reply from {message.FromAddr} matched ReqNo {req.ReqNo}.");
 
-            var partyType = (await dms.GetPartyTypesAsync()).FirstOrDefault(p => p.PartyTpId == req.PartyTpId);
+            var partyType = partyTypes.FirstOrDefault(p => p.PartyTpId == req.PartyTpId);
 
             if (partyType is null)
             {
@@ -917,7 +914,7 @@ namespace EMF.Mail.Services
             if (isApproved && partyId is int approvedId)
             {
                 foreach (var heldMsg in pending)
-                    prepared.Add(await PrepareHeldMessageAsync(account, mail, heldMsg, docTypes, msgTypes, partyType, approvedId, partyName));
+                    prepared.Add(await PrepareHeldMessageAsync(account, mail, heldMsg, app, new Party(partyType, approvedId, partyName)));
 
                 var mismatches = prepared.SelectMany(p => p.Mismatches).ToList();
                 if (mismatches.Count > 0)
@@ -956,7 +953,7 @@ namespace EMF.Mail.Services
                     await FinalizeAsync(new MessageFinalization { MsgNo = heldMsg.MsgNo, ResTpCode = "REJECTED", MsgResult = "Sender rejected by administrator." });
             else if (partyId is int linkedId)
                 foreach (var held in prepared)
-                    await ReprocessHeldMessageAsync(account, mail, held, req.SenderId, partyType, linkedId, partyName, process, msgTypes, fieldsByMsgType);
+                    await ReprocessHeldMessageAsync(account, mail, held, req.SenderId, new Party(partyType, linkedId, partyName), app);
 
             await mail.ReplyAsync(message.ProvMsgId, isApproved
                 ? $"Your approval was processed. Sender {req.FromAddr} was linked to {partyName}. {pending.Count} pending message(s) will be processed. Please check for individual results."
