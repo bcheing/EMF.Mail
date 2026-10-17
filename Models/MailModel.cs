@@ -9,26 +9,25 @@ using System.Collections.Generic;
 // MAILBOX (provider side: GraphMailService, ImapMailService; SMTP settings ride on ImapAccount)
 // Account                    msg.LstAccounts row (/msg/mail/accounts). Bridges both sides: it is a msg row
 //                            that holds the provider settings.
-// AccountBookmark            LastMsgLink, where the next poll starts (/filer/msg/lastpoll write,
-//                            /msg/mail/bookmark read).
+// AccountBookmark            LastMsgLink, where the next poll starts (/msg/mail/bookmark read; written by
+//                            /msg/job/end after a successful download).
 // GraphAccount, ImapAccount  connection details built from Account by MailServiceFactory.
-// InternetMessageHeader      list-level summary of a mailbox message (DMS Mail page: messages past the bookmark).
 // InternetMessage            full inbound message (body, attachments, threading ids); what MessageProcessor works on.
 // InternetMessageAttachment  one attachment as the provider returns it.
 //
 // LOG (msg.TblMessages, msg.TblMsgItems)
-// 1. Message                 logs an InternetMessage (/filer/msg/message) and returns a MessageResult (MsgNo,
+// 1. Message                 logs an InternetMessage (/msg/messages/save) and returns a MessageResult (MsgNo,
 //                            SenderId). A failed log stops the account run: nothing is processed without a MsgNo.
-// 2. MessageItem             links the MsgNo to the packages and documents it created (/filer/msg/msgitems).
-// 3. MessageFinalization     terminal state: message type, result type, result text (/filer/msg/finalize).
-// 4. MessageEntry            the logged row read back with its result label and severity (/msg/mail/messages,
+// 2. MessageItem             links the MsgNo to the packages and documents it created (/msg/messages/items).
+// 3. MessageFinalization     terminal state: message type, result type, result text (/msg/messages/finalize).
+// 4. MessageEntry            the logged row read back with its result label and severity (/msg/messages/list,
 //                            DMS Mail page).
 // MessageBase                the fields Message and MessageEntry share.
 //
 // APPROVAL (msg.TblApprRequests, msg.TblApprReqItems): message from a sender not yet approved
 // ApprRequest, ApprRequestItem  the open hold and the messages held under it.
 // CmdResult                  CommandService's reading of the admin's reply (APPROVE/REJECT, party name).
-// ApprResolution             the admin's decision, written in one call (/filer/msg/resolvecmd).
+// ApprResolution             the admin's decision, written in one call (/msg/appr/resolve).
 // SenderHistory              past parties and document types for a sender (reinforcement hint, not yet wired).
 // Party                      the party a sender submits for (type, id, name).
 //
@@ -60,7 +59,7 @@ namespace EMF.Mail.Models
         public string? LastMsgLink { get; set; }
     }
     public class AccountBookmark
-    // Payload for /filer/msg/lastpoll and result of /msg/mail/bookmark -- LastPollDT stays as an audit "last run" timestamp; LastMsgLink is
+    // Result of /msg/mail/bookmark -- LastPollDT stays as an audit "last run" timestamp; LastMsgLink is
     // the actual delta bookmark now driving what GetChangedMessagesAsync fetches next round.
     {
         public int AcctId { get; set; }
@@ -71,7 +70,15 @@ namespace EMF.Mail.Models
     public record ImapAccount(string AcctName, string ImapHost, int ImapPort, string SmtpHost, int SmtpPort);
 
     // Classes related to inbound messages
-    public class InternetMessageHeader
+    public class InternetMessage
+    // Provider-agnostic inbound message, mapped from whatever the underlying mail provider returns
+    // (GraphMailService and ImapMailService) so MessageProcessor never touches a
+    // provider SDK type directly. ProvMsgId is the provider's own id for the message in this mailbox
+    // (Graph's Id, IMAP's uidValidity:uid), saved as msg.TblMessages.ProvMsgId for later provider calls
+    // (reply/forward/send). InternetMessageId is the RFC5322 id (msg.TblMessages.MsgId). MimeContent is the
+    // raw message, stored once in msg.TblMailMessages and re-read from there by every later step.
+    // OrigMsgId/BridgeMsgIds are computed by the provider from its own header mechanics at mapping time,
+    // so no raw header list needs to flow through MessageProcessor either.
     {
         public string ProvMsgId { get; set; } = string.Empty;
         public string? InternetMessageId { get; set; }
@@ -79,23 +86,13 @@ namespace EMF.Mail.Models
         public string FromName { get; set; } = string.Empty;
         public string Subject { get; set; } = string.Empty;
         public DateTime ReceivedDateTime { get; set; }
-        public virtual bool HasAttachments { get; set; }
-    }
-    public class InternetMessage : InternetMessageHeader
-    // Provider-agnostic inbound message, mapped from whatever the underlying mail provider returns
-    // (GraphMailService and ImapMailService) so MessageProcessor never touches a
-    // provider SDK type directly. ProvMsgId is the provider's own opaque message id (Graph's Id) --
-    // used only to make further provider calls (reply/forward/send) against this same
-    // message, never persisted. InternetMessageId is the RFC5322 id that IS persisted (msg.TblMessages.MsgId).
-    // OrigMsgId/BridgeMsgIds are computed by the provider from its own header mechanics at mapping time,
-    // so no raw header list needs to flow through MessageProcessor either.
-    {
         public string Body { get; set; } = string.Empty;
         public string UniqueBody { get; set; } = string.Empty;
         public List<InternetMessageAttachment> Attachments { get; set; } = [];
-        public override bool HasAttachments => Attachments.Count > 0;
+        public bool HasAttachments => Attachments.Count > 0;
         public string? OrigMsgId { get; set; }
         public List<string> BridgeMsgIds { get; set; } = [];
+        public byte[] MimeContent { get; set; } = [];
     }
     public record InternetMessageAttachment(string FileName, byte[] Bytes, string MediaType);
 
@@ -113,17 +110,19 @@ namespace EMF.Mail.Models
     {
         public int AcctId { get; set; }
         public string? OrigMsgId { get; set; }
+        public string ProvMsgId { get; set; } = string.Empty;
+        public int JobNo { get; set; }
+        public string? MsgContent { get; set; }
     }
     public class MessageEntry : MessageBase
     {
         public int MsgNo { get; set; }
-        public bool IsProcessed { get; set; }
         public bool IsFinal { get; set; }
         public string? MsgTpCode { get; set; }
-        public string? ResTpCode { get; set; }
-        public string? ResTpLabel { get; set; }
-        public string? ResTpSeverity { get; set; }
-        public string? MsgResult { get; set; }
+        public string? QCode { get; set; }
+        public string? QName { get; set; }
+        public string? QSeverity { get; set; }
+        public string? EvtResult { get; set; }
     }
     public class MessageItem
     {
@@ -136,10 +135,33 @@ namespace EMF.Mail.Models
         public int MsgNo { get; set; } 
         public int SenderId { get; set; } 
     }
+    public class QueuedMessage
+    {
+        public int MsgNo { get; set; }
+        public string MsgId { get; set; } = string.Empty;
+        public string? ProvMsgId { get; set; }
+        public int SenderId { get; set; }
+        public bool HasContent { get; set; }
+    }
+    public class MessageContent
+    {
+        public int MsgNo { get; set; }
+        public string MsgId { get; set; } = string.Empty;
+        public string? ProvMsgId { get; set; }
+        public string? QCode { get; set; }
+        public DateTime? MsgDT { get; set; }
+        public byte[]? MsgContent { get; set; }
+    }
+
+    // Classes related to msg.TblJobs
+    public class JobResult
+    {
+        public int? JobNo { get; set; }
+    }
     public class MessageFinalization
-    // Payload for /filer/msg/finalize -- single write-back point for a message's terminal state. Null
+    // Payload for /msg/messages/finalize -- single write-back point for a message's terminal state. Null
     // fields leave the corresponding column untouched (see the proc). IReqNo absorbs what used to be a
-    // separate /filer/msg/linkreply call -- only ever set on the RFI-reply finalize.
+    // separate linkreply call -- only ever set on the RFI-reply finalize.
     {
         public int MsgNo { get; set; }
         public object? MsgContext { get; set; }

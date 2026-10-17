@@ -4,12 +4,11 @@ using EMF.Mail.Models;
 using Microsoft.Graph;
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 using EmailAddress = Microsoft.Graph.Models.EmailAddress;
 using FileAttachment = Microsoft.Graph.Models.FileAttachment;
-using FollowupFlag = Microsoft.Graph.Models.FollowupFlag;
-using FollowupFlagStatus = Microsoft.Graph.Models.FollowupFlagStatus;
 using GraphMessage = Microsoft.Graph.Models.Message;
 using Recipient = Microsoft.Graph.Models.Recipient;
 
@@ -39,7 +38,7 @@ namespace EMF.Mail.Services
         // for changeType (see msgraph-sdk-dotnet #2195/#1689), so this is the only reliable way to apply it. Scoped
         // to "received from right now on" (the one $filter shape message delta supports) plus changeType=created,
         // so this returns zero messages immediately and an @odata.deltaLink that only ever surfaces new mail from
-        // here on -- our own FlagProcessedAsync/MarkNeedsReviewAsync writes, and the sender's own flag/read/move
+        // here on -- the sender's own flag/read/move
         // actions, never come back as phantom "changes" to reprocess. changeType can only be set on this first
         // call of a round -- it rides along inside every later @odata.nextLink/@odata.deltaLink automatically.
         public async Task<(List<InternetMessage> Messages, string DeltaLink)> GetChangedMessagesAsync(string? lastMsgLink)
@@ -66,7 +65,15 @@ namespace EMF.Mail.Services
                 result = await builder.WithUrl(result.OdataNextLink).GetAsDeltaGetResponseAsync();
             }
 
-            return (messages.Select(MapMessage).ToList(), result?.OdataDeltaLink ?? lastMsgLink ?? "");
+            var mapped = new List<InternetMessage>();
+            foreach (var message in messages)
+            {
+                var internetMessage = MapMessage(message);
+                internetMessage.MimeContent = await GetMimeContentAsync(internetMessage.ProvMsgId);
+                mapped.Add(internetMessage);
+            }
+
+            return (mapped, result?.OdataDeltaLink ?? lastMsgLink ?? "");
         }
         // In-Reply-To is a standard RFC 5322 header -- provider-agnostic, unlike Graph's own conversationId.
 
@@ -83,19 +90,14 @@ namespace EMF.Mail.Services
             });
 
             var message = result?.Value?.FirstOrDefault();
-            return message is null ? null : MapMessage(message);
+            if (message is null) return null;
+
+            var internetMessage = MapMessage(message);
+            internetMessage.MimeContent = await GetMimeContentAsync(internetMessage.ProvMsgId);
+            return internetMessage;
         }
-        public Task<List<InternetMessageHeader>> GetNewMessageHeadersAsync(string lastMsgLink) => throw new NotSupportedException("Listing message headers is not supported for Graph accounts yet.");
-        public Task FlagProcessedAsync(string provMsgId) => _graph.Users[_mailboxUpn].Messages[provMsgId].PatchAsync(new GraphMessage
-        {
-            Flag = new FollowupFlag { FlagStatus = FollowupFlagStatus.Flagged }
-        });
-        public Task MarkNeedsReviewAsync(string provMsgId) => _graph.Users[_mailboxUpn].Messages[provMsgId].PatchAsync(new GraphMessage
-        {
-            Categories = ["NeedsReview"]
-        });
-        public Task ReplyAsync(string provMsgId, string comment) => _graph.Users[_mailboxUpn].Messages[provMsgId].Reply.PostAsync(new() { Comment = comment });
-        public Task ForwardAsync(string provMsgId, string toAddr, string comment) => _graph.Users[_mailboxUpn].Messages[provMsgId].Forward.PostAsync(new()
+        public Task ReplyAsync(InternetMessage message, string comment) => _graph.Users[_mailboxUpn].Messages[message.ProvMsgId].Reply.PostAsync(new() { Comment = comment });
+        public Task ForwardAsync(InternetMessage message, string toAddr, string comment) => _graph.Users[_mailboxUpn].Messages[message.ProvMsgId].Forward.PostAsync(new()
         {
             Comment = comment,
             ToRecipients = [new Recipient { EmailAddress = new EmailAddress { Address = toAddr } }]
@@ -105,9 +107,9 @@ namespace EMF.Mail.Services
         // that id becomes FwdMsgId, the anchor the admin's reply chain gets matched back against.
         // comment now varies by call site -- whether Claude proposed a candidate vendor or not -- instead of
         // being a single hardcoded sentence.
-        public async Task<string?> SendApprovalRequestAsync(string provMsgId, string toAddr, string comment)
+        public async Task<string?> SendApprovalRequestAsync(InternetMessage message, string toAddr, string comment)
         {
-            var draft = await _graph.Users[_mailboxUpn].Messages[provMsgId].CreateForward.PostAsync(new()
+            var draft = await _graph.Users[_mailboxUpn].Messages[message.ProvMsgId].CreateForward.PostAsync(new()
             {
                 Comment = comment,
                 ToRecipients = [new Recipient { EmailAddress = new EmailAddress { Address = toAddr } }]
@@ -123,9 +125,9 @@ namespace EMF.Mail.Services
         // an RFI (the ask for missing attachments) uses createReply+send instead, to capture the sent
         // message's own InternetMessageId as msg.TblInfoRequests.SentMsgId, the bridge target for whichever
         // reply the vendor eventually sends back.
-        public async Task<string?> SendInfoRequestAsync(string provMsgId, string comment)
+        public async Task<string?> SendInfoRequestAsync(InternetMessage message, string comment)
         {
-            var draft = await _graph.Users[_mailboxUpn].Messages[provMsgId].CreateReply.PostAsync(new() { Comment = comment });
+            var draft = await _graph.Users[_mailboxUpn].Messages[message.ProvMsgId].CreateReply.PostAsync(new() { Comment = comment });
 
             if (draft?.Id is null) return null;
 
@@ -135,6 +137,13 @@ namespace EMF.Mail.Services
         }
 
         #region Private methods
+        private async Task<byte[]> GetMimeContentAsync(string provMsgId)
+        {
+            using var ms = new MemoryStream();
+            using var stream = await _graph.Users[_mailboxUpn].Messages[provMsgId].Content.GetAsync();
+            if (stream is not null) await stream.CopyToAsync(ms);
+            return ms.ToArray();
+        }
         private static InternetMessage MapMessage(GraphMessage message) => new()
         {
             ProvMsgId = message.Id ?? "",

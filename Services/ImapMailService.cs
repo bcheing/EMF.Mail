@@ -20,7 +20,6 @@ namespace EMF.Mail.Services
     {
         private readonly ImapAccount _account = account;
         private readonly string _password = password;
-        private const string NeedsReviewFolderName = "NeedsReview";
 
         #region Public methods
 
@@ -54,7 +53,7 @@ namespace EMF.Mail.Services
             foreach (var uid in uids)
             {
                 var mime = await inbox.GetMessageAsync(uid);
-                messages.Add(GetMappedMessage(mime, uidValidity, uid));
+                messages.Add(MimeMapper.GetInternetMessage(mime, $"{uidValidity}:{uid.Id}"));
             }
 
             var newLastUid = uids.Count > 0 ? uids.Max(u => u.Id) : lastUid;
@@ -73,46 +72,11 @@ namespace EMF.Mail.Services
             if (uids.Count == 0) return null;
 
             var mime = await inbox.GetMessageAsync(uids[0]);
-            return GetMappedMessage(mime, inbox.UidValidity, uids[0]);
+            return MimeMapper.GetInternetMessage(mime, $"{inbox.UidValidity}:{uids[0].Id}");
         }
-        public async Task<List<InternetMessageHeader>> GetNewMessageHeadersAsync(string lastMsgLink)
+        public async Task ReplyAsync(InternetMessage message, string comment)
         {
-            using var client = await GetClientAsync();
-            var inbox = await GetInboxAsync(client, FolderAccess.ReadOnly);
-
-            var (storedValidity, lastUid) = GetLastBookmark(lastMsgLink);
-            if (storedValidity != inbox.UidValidity) return [];
-
-            var items = MessageSummaryItems.UniqueId | MessageSummaryItems.Envelope | MessageSummaryItems.Flags | MessageSummaryItems.InternalDate | MessageSummaryItems.BodyStructure;
-            var range = new UniqueIdRange(new UniqueId(inbox.UidValidity, lastUid + 1), UniqueId.MaxValue);
-            var summaries = await inbox.FetchAsync(range, new FetchRequest(items));
-
-            // ai: IMAP resolves "lastUid+1:*" to the highest existing UID when nothing is newer, so the last bookmarked message comes back; filter it out.
-            return summaries.Where(s => s.UniqueId.Id > lastUid).OrderByDescending(s => s.UniqueId.Id).Select(s => GetMessageHeader(s, inbox.UidValidity)).ToList();
-        }
-        public async Task FlagProcessedAsync(string provMsgId)
-        {
-            var uid = GetUniqueId(provMsgId);
-            using var client = await GetClientAsync();
-            var inbox = await GetInboxAsync(client, FolderAccess.ReadWrite);
-            await inbox.AddFlagsAsync(uid, MessageFlags.Flagged, silent: true);
-        }
-        public async Task MarkNeedsReviewAsync(string provMsgId)
-        {
-            var uid = GetUniqueId(provMsgId);
-            using var client = await GetClientAsync();
-            var inbox = await GetInboxAsync(client, FolderAccess.ReadWrite);
-
-            var reviewFolder = await GetOrCreateNeedsReviewFolderAsync(client);
-            await inbox.MoveToAsync(uid, reviewFolder);
-        }
-        public async Task ReplyAsync(string provMsgId, string comment)
-        {
-            var uid = GetUniqueId(provMsgId);
-
-            using var imap = await GetClientAsync();
-            var inbox = await GetInboxAsync(imap, FolderAccess.ReadOnly);
-            var orig = await inbox.GetMessageAsync(uid);
+            var orig = MimeMapper.GetMimeMessage(message.MimeContent);
 
             var reply = new MimeMessage();
             reply.From.Add(MailboxAddress.Parse(_account.AcctName));
@@ -124,39 +88,27 @@ namespace EMF.Mail.Services
 
             await SendAsync(reply);
         }
-        public async Task ForwardAsync(string provMsgId, string toAddr, string comment)
+        public async Task ForwardAsync(InternetMessage message, string toAddr, string comment)
         {
-            var uid = GetUniqueId(provMsgId);
-
-            using var imap = await GetClientAsync();
-            var inbox = await GetInboxAsync(imap, FolderAccess.ReadOnly);
-            var orig = await inbox.GetMessageAsync(uid);
+            var orig = MimeMapper.GetMimeMessage(message.MimeContent);
 
             await SendAsync(GetBuiltMessage(_account, orig, toAddr, comment));
         }
         // Message-Id is generated here (not server-assigned post-send the way Graph's createForward is) --
         // set via MimeMessage.MessageId (bare id) and read back via the raw header (bracketed), so the
         // returned value matches the bracketed format everything else in this pipeline compares against.
-        public async Task<string?> SendApprovalRequestAsync(string provMsgId, string toAddr, string comment)
+        public async Task<string?> SendApprovalRequestAsync(InternetMessage message, string toAddr, string comment)
         {
-            var uid = GetUniqueId(provMsgId);
-
-            using var imap = await GetClientAsync();
-            var inbox = await GetInboxAsync(imap, FolderAccess.ReadOnly);
-            var orig = await inbox.GetMessageAsync(uid);
+            var orig = MimeMapper.GetMimeMessage(message.MimeContent);
 
             var forward = GetBuiltMessage(_account, orig, toAddr, comment);
             await SendAsync(forward);
 
             return forward.Headers[HeaderId.MessageId];
         }
-        public async Task<string?> SendInfoRequestAsync(string provMsgId, string comment)
+        public async Task<string?> SendInfoRequestAsync(InternetMessage message, string comment)
         {
-            var uid = GetUniqueId(provMsgId);
-
-            using var imap = await GetClientAsync();
-            var inbox = await GetInboxAsync(imap, FolderAccess.ReadOnly);
-            var orig = await inbox.GetMessageAsync(uid);
+            var orig = MimeMapper.GetMimeMessage(message.MimeContent);
 
             var reply = new MimeMessage();
             reply.From.Add(MailboxAddress.Parse(_account.AcctName));
@@ -175,11 +127,6 @@ namespace EMF.Mail.Services
 
         #region Private methods
 
-        private static UniqueId GetUniqueId(string provMsgId)
-        {
-            var parts = provMsgId.Split(':');
-            return new UniqueId(uint.Parse(parts[0]), uint.Parse(parts[1]));
-        }
         private static (uint UidValidity, uint LastUid) GetLastBookmark(string? lastMsgLink)
         {
             if (lastMsgLink is null) return (0, 0);
@@ -199,85 +146,6 @@ namespace EMF.Mail.Services
             await inbox.OpenAsync(access);
             return inbox;
         }
-        private static async Task<IMailFolder> GetOrCreateNeedsReviewFolderAsync(ImapClient client)
-        {
-            try
-            {
-                return client.GetFolder(NeedsReviewFolderName);
-            }
-            catch (FolderNotFoundException)
-            {
-                var personal = client.GetFolder(client.PersonalNamespaces[0]);
-                return await personal.CreateAsync(NeedsReviewFolderName, isMessageFolder: true)
-                    ?? throw new InvalidOperationException($"Failed to create '{NeedsReviewFolderName}' folder.");
-            }
-        }
-        private static byte[] GetBinaryContent(MimePart part)
-        {
-            using var ms = new MemoryStream();
-            part.Content?.DecodeTo(ms);
-            return ms.ToArray();
-        }
-        // Mirrors GraphMailService.GetBridgeMsgIds exactly -- In-Reply-To first, then References read
-        // root-first -- against MimeKit's raw header values instead of Graph's InternetMessageHeaders.
-        private static List<string> GetBridgeMsgIds(MimeMessage mime)
-        {
-            var candidates = new List<string>();
-
-            var inReplyTo = mime.Headers[HeaderId.InReplyTo];
-            if (inReplyTo is not null)
-                candidates.Add(inReplyTo);
-
-            var references = mime.Headers[HeaderId.References];
-            if (references is not null)
-            {
-                var ids = references.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-                for (var i = ids.Length - 1; i >= 0; i--)
-                    if (!candidates.Contains(ids[i]))
-                        candidates.Add(ids[i]);
-            }
-
-            return candidates;
-        }
-        // Raw header values (with angle brackets) are used throughout -- deliberately, to match the
-        // bracketed format Graph's InternetMessageId already carries, since these values are compared
-        // verbatim against msg.TblMessages.FwdMsgId/SentMsgId regardless of which provider wrote them.
-
-        private static InternetMessageHeader GetMessageHeader(IMessageSummary summary, uint uidValidity)
-        {
-            var sender = summary.Envelope.From.Mailboxes.FirstOrDefault();
-
-            return new InternetMessageHeader
-            {
-                ProvMsgId = $"{uidValidity}:{summary.UniqueId.Id}",
-                InternetMessageId = summary.Envelope.MessageId is string msgId ? $"<{msgId}>" : null,
-                FromAddr = sender?.Address ?? "",
-                FromName = sender?.Name ?? "",
-                Subject = summary.Envelope.Subject ?? "",
-                ReceivedDateTime = summary.InternalDate?.UtcDateTime ?? DateTime.MinValue,
-                HasAttachments = summary.Attachments.Any()
-            };
-        }
-        private static InternetMessage GetMappedMessage(MimeMessage mime, uint uidValidity, UniqueId uid) => new()
-        {
-            ProvMsgId = $"{uidValidity}:{uid.Id}",
-            InternetMessageId = mime.Headers[HeaderId.MessageId],
-            FromAddr = mime.From.Mailboxes.FirstOrDefault()?.Address ?? "",
-            FromName = mime.From.Mailboxes.FirstOrDefault()?.Name ?? "",
-            ReceivedDateTime = mime.Date.UtcDateTime,
-            Subject = mime.Subject ?? "",
-            Body = mime.HtmlBody ?? mime.TextBody ?? "",
-            // No IMAP/MimeKit equivalent of Graph's server-stripped uniqueBody exists -- full body reused
-            // here as a deliberate, noted simplification (see ProjectContext).
-            UniqueBody = mime.HtmlBody ?? mime.TextBody ?? "",
-            Attachments = mime.Attachments.OfType<MimePart>()
-                .Select(p => (Part: p, Bytes: GetBinaryContent(p)))
-                .Where(x => x.Bytes.Length > 0)
-                .Select(x => new InternetMessageAttachment(x.Part.FileName ?? "attachment", x.Bytes, Filer.GetMediaType(x.Part.FileName ?? "")))
-                .ToList(),
-            OrigMsgId = mime.Headers[HeaderId.InReplyTo],
-            BridgeMsgIds = GetBridgeMsgIds(mime)
-        };
         // Graph's /forward embeds the full original message automatically; MailKit has no equivalent
         // helper, so the original is attached here as a real .eml (message/rfc822) part -- simple, and
         // (unlike Reply's inline quoting) worth doing regardless of "start simple": an approval-hold

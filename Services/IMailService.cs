@@ -11,14 +11,9 @@ namespace EMF.Mail.Services
     {
         Task<(List<InternetMessage> Messages, string DeltaLink)> GetChangedMessagesAsync(string? lastMsgLink);
         Task<InternetMessage?> GetMessageByIdAsync(string internetMessageId);
-        Task<List<InternetMessageHeader>> GetNewMessageHeadersAsync(string lastMsgLink);
-        [System.Obsolete("Processing status is tracked in msg.TblMessages and shown on the DMS Mail page; the mailbox is no longer flagged or moved.")]
-        Task FlagProcessedAsync(string provMsgId);
-        [System.Obsolete("Processing status is tracked in msg.TblMessages and shown on the DMS Mail page; the mailbox is no longer flagged or moved.")]
-        Task MarkNeedsReviewAsync(string provMsgId);
-        Task ReplyAsync(string provMsgId, string comment);
-        Task ForwardAsync(string provMsgId, string toAddr, string comment);
-        Task<string?> SendApprovalRequestAsync(string provMsgId, string toAddr, string comment);
-        Task<string?> SendInfoRequestAsync(string provMsgId, string comment);
+        Task ReplyAsync(InternetMessage message, string comment);
+        Task ForwardAsync(InternetMessage message, string toAddr, string comment);
+        Task<string?> SendApprovalRequestAsync(InternetMessage message, string toAddr, string comment);
+        Task<string?> SendInfoRequestAsync(InternetMessage message, string comment);
     }
 }
